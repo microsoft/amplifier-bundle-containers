@@ -9,7 +9,6 @@ defaults, and container lifecycle management.
 from __future__ import annotations
 
 import asyncio
-import fnmatch
 import json
 import os
 import shutil
@@ -18,21 +17,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-__amplifier_module_type__ = "tool"
+from .images import resolve_purpose
+from .provisioner import resolve_env_passthrough
+from .runtime import ContainerRuntime
 
+__amplifier_module_type__ = "tool"
 
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class CommandResult:
-    """Result of a container runtime command."""
-
-    returncode: int
-    stdout: str
-    stderr: str
 
 
 @dataclass
@@ -65,69 +58,6 @@ class CreateParams:
     persistent: bool = False
     labels: dict[str, str] = field(default_factory=dict)
     session_id: str | None = None
-
-
-# ---------------------------------------------------------------------------
-# Container Runtime
-# ---------------------------------------------------------------------------
-
-
-class ContainerRuntime:
-    """Detects and wraps Docker or Podman CLI."""
-
-    def __init__(self) -> None:
-        self._runtime: str | None = None
-
-    async def detect(self) -> str | None:
-        """Return 'docker' or 'podman' or None. Prefer podman (rootless)."""
-        if self._runtime is not None:
-            return self._runtime
-        for candidate in ("podman", "docker"):
-            if shutil.which(candidate):
-                self._runtime = candidate
-                return candidate
-        return None
-
-    async def run(self, *args: str, timeout: int = 300) -> CommandResult:
-        """Execute a runtime command and return structured result."""
-        runtime = await self.detect()
-        if runtime is None:
-            return CommandResult(
-                returncode=1,
-                stdout="",
-                stderr="No container runtime (docker/podman) found on PATH",
-            )
-        proc = await asyncio.create_subprocess_exec(
-            runtime,
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.communicate()
-            return CommandResult(
-                returncode=-1,
-                stdout="",
-                stderr=f"Command timed out after {timeout}s",
-            )
-        return CommandResult(
-            returncode=proc.returncode or 0,
-            stdout=stdout_bytes.decode(errors="replace"),
-            stderr=stderr_bytes.decode(errors="replace"),
-        )
-
-    async def is_daemon_running(self) -> bool:
-        result = await self.run("info", "--format", "json", timeout=10)
-        return result.returncode == 0
-
-    async def user_has_permissions(self) -> bool:
-        result = await self.run("ps", "-q", timeout=10)
-        return result.returncode == 0
 
 
 # ---------------------------------------------------------------------------
@@ -167,213 +97,6 @@ class MetadataStore:
             if meta_path.exists():
                 results.append(json.loads(meta_path.read_text()))
         return results
-
-
-# ---------------------------------------------------------------------------
-# Purpose Profiles
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class PurposeProfile:
-    """Smart defaults for a container purpose."""
-
-    image: str
-    packages: list[str] = field(default_factory=list)
-    setup_commands: list[str] = field(default_factory=list)
-    env: dict[str, str] = field(default_factory=dict)
-    forward_git: bool = True
-    forward_gh: bool = True
-    forward_ssh: bool = False
-    dotfiles: bool = True
-
-
-PURPOSE_PROFILES: dict[str, PurposeProfile] = {
-    "python": PurposeProfile(
-        image="python:3.12-slim",
-        packages=["git", "curl", "build-essential"],
-        setup_commands=[
-            "pip install --quiet uv",
-            "uv venv /workspace/.venv",
-        ],
-        env={
-            "VIRTUAL_ENV": "/workspace/.venv",
-            "PATH": "/workspace/.venv/bin:$PATH",
-        },
-    ),
-    "node": PurposeProfile(
-        image="node:20-slim",
-        packages=["git", "curl"],
-        setup_commands=["corepack enable"],
-    ),
-    "rust": PurposeProfile(
-        image="rust:1-slim",
-        packages=[
-            "git",
-            "curl",
-            "build-essential",
-            "pkg-config",
-            "libssl-dev",
-        ],
-    ),
-    "go": PurposeProfile(
-        image="golang:1.22",
-        packages=["git", "curl"],
-    ),
-    "general": PurposeProfile(
-        image="ubuntu:24.04",
-        packages=[
-            "git",
-            "curl",
-            "build-essential",
-            "wget",
-            "jq",
-            "tree",
-            "vim-tiny",
-            "less",
-            "make",
-        ],
-    ),
-    "amplifier": PurposeProfile(
-        image="python:3.12-slim",
-        packages=["git", "curl", "jq"],
-        setup_commands=[
-            "pip install --quiet uv",
-            "uv tool install amplifier",
-        ],
-        forward_git=True,
-        forward_gh=True,
-    ),
-    "clean": PurposeProfile(
-        image="ubuntu:24.04",
-        packages=["git", "curl"],
-        forward_git=False,
-        forward_gh=False,
-        forward_ssh=False,
-        dotfiles=False,
-    ),
-}
-
-
-def resolve_purpose(purpose: str, explicit: dict[str, Any]) -> dict[str, Any]:
-    """Merge purpose profile defaults with explicit parameters.
-
-    Explicit parameters always win over purpose defaults.
-    """
-    profile = PURPOSE_PROFILES.get(purpose)
-    if profile is None:
-        return explicit
-
-    defaults: dict[str, Any] = {
-        "image": profile.image,
-        "forward_git": profile.forward_git,
-        "forward_gh": profile.forward_gh,
-        "forward_ssh": profile.forward_ssh,
-    }
-    if profile.dotfiles is False:
-        defaults["dotfiles_skip"] = True
-
-    # Purpose setup_commands prepend to explicit ones
-    purpose_setup: list[str] = []
-    if profile.packages:
-        pkg_list = " ".join(profile.packages)
-        purpose_setup.append(f"apt-get update -qq && apt-get install -y -qq {pkg_list}")
-    purpose_setup.extend(profile.setup_commands)
-
-    merged = {**defaults, **{k: v for k, v in explicit.items() if v is not None}}
-    existing_setup = merged.get("setup_commands", [])
-    merged["setup_commands"] = purpose_setup + list(existing_setup)
-    if profile.env:
-        merged_env = {**profile.env, **merged.get("env", {})}
-        merged["env"] = merged_env
-
-    return merged
-
-
-# ---------------------------------------------------------------------------
-# Environment Variable Matching
-# ---------------------------------------------------------------------------
-
-NEVER_PASSTHROUGH = {
-    "PATH",
-    "HOME",
-    "SHELL",
-    "USER",
-    "LOGNAME",
-    "PWD",
-    "OLDPWD",
-    "TERM",
-    "DISPLAY",
-    "DBUS_SESSION_BUS_ADDRESS",
-    "XDG_RUNTIME_DIR",
-    "SSH_AUTH_SOCK",
-    "SSH_CONNECTION",
-    "SSH_CLIENT",
-    "SSH_TTY",
-    "LS_COLORS",
-    "LANG",
-    "LC_ALL",
-    "HOSTNAME",
-    "SHLVL",
-    "_",
-}
-
-DEFAULT_ENV_PATTERNS = [
-    "*_API_KEY",
-    "*_TOKEN",
-    "*_SECRET",
-    "ANTHROPIC_*",
-    "OPENAI_*",
-    "AZURE_OPENAI_*",
-    "GOOGLE_*",
-    "GEMINI_*",
-    "OLLAMA_*",
-    "VLLM_*",
-    "AMPLIFIER_*",
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "NO_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "no_proxy",
-]
-
-
-def match_env_patterns(env: dict[str, str], patterns: list[str]) -> dict[str, str]:
-    """Return env vars whose keys match any of the glob patterns."""
-    matched: dict[str, str] = {}
-    for key, value in env.items():
-        if key in NEVER_PASSTHROUGH:
-            continue
-        for pattern in patterns:
-            if fnmatch.fnmatch(key, pattern):
-                matched[key] = value
-                break
-    return matched
-
-
-def resolve_env_passthrough(
-    mode: str | list[str],
-    extra_env: dict[str, str],
-    config_patterns: list[str] | None = None,
-) -> dict[str, str]:
-    """Determine the full set of env vars to inject into a container."""
-    host_env = dict(os.environ)
-    patterns = config_patterns or DEFAULT_ENV_PATTERNS
-
-    if isinstance(mode, list):
-        # Explicit list of var names
-        base = {k: host_env[k] for k in mode if k in host_env}
-    elif mode == "all":
-        base = {k: v for k, v in host_env.items() if k not in NEVER_PASSTHROUGH}
-    elif mode == "none":
-        base = {}
-    else:  # "auto"
-        base = match_env_patterns(host_env, patterns)
-
-    # Explicit extra_env always wins
-    base.update(extra_env)
-    return base
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +259,7 @@ class ContainersTool:
                 ),
             }
         )
+
         if runtime is None:
             return {
                 "ready": False,
@@ -833,7 +557,7 @@ class ContainersTool:
         # Detect best available shell
         for shell in ("/bin/bash", "/bin/zsh", "/bin/sh"):
             result = await self.runtime.run(
-                "exec", container, "test", "-x", shell, timeout=10
+                "exec", container, "test", "-x", shell, timeout=5
             )
             if result.returncode == 0:
                 return {
@@ -961,7 +685,7 @@ class ContainersTool:
         if not container or not snapshot_name:
             return {"error": "Both 'container' and 'name' are required"}
         image_tag = f"amplifier-snapshot:{snapshot_name}"
-        result = await self.runtime.run("commit", container, image_tag, timeout=120)
+        result = await self.runtime.run("commit", container, image_tag, timeout=60)
         return {
             "success": result.returncode == 0,
             "snapshot": snapshot_name,
@@ -1059,7 +783,7 @@ class ContainersTool:
             f'echo "export GITHUB_TOKEN={token}" >> /root/.bashrc'
         )
         await self.runtime.run(
-            "exec", container, "/bin/sh", "-c", env_script, timeout=10
+            "exec", container, "/bin/sh", "-c", env_script, timeout=5
         )
         # If gh is in the container, do full auth login
         gh_check = await self.runtime.run("exec", container, "which", "gh", timeout=5)
@@ -1100,7 +824,7 @@ class ContainersTool:
             clone_cmd += f" --branch {branch}"
         clone_cmd += f" {repo} {target}"
         result = await self.runtime.run(
-            "exec", container, "/bin/sh", "-c", clone_cmd, timeout=120
+            "exec", container, "/bin/sh", "-c", clone_cmd, timeout=60
         )
         if result.returncode != 0:
             return  # Clone failed, skip silently
