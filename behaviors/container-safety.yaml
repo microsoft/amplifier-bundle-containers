@@ -1,0 +1,27 @@
+bundle:
+  name: behavior-container-safety
+  version: 0.1.0
+  description: Safety policies for container operations (approval gates, cleanup, limits)
+
+hooks:
+  - module: hooks-container-safety
+    source: "containers:modules/hooks-container-safety"
+    config:
+      require_approval_for:
+        - gpu_access
+        - host_network
+        - sensitive_mounts
+        - ssh_forwarding
+        - all_env_passthrough
+        - destroy_all
+      sensitive_mount_prefixes:
+        - "/"
+        - "/etc"
+        - "/var"
+        - "/root"
+        - "/home"
+        - "/boot"
+        - "/sys"
+        - "/proc"
+      auto_cleanup_on_session_end: true
+      max_containers_per_session: 10

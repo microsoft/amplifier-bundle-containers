@@ -1,0 +1,93 @@
+# Container Management
+
+You have access to the `containers` tool for creating and managing isolated container environments (Docker/Podman).
+
+## When to Use
+
+- User wants to try something safely without affecting their host
+- Parallel isolated workloads are needed
+- A clean development environment is requested
+- Building, testing, or running untrusted code
+- Service prototyping (databases, caches, app servers)
+- Any scenario requiring isolation from the host environment
+
+## Quick Start
+
+```
+1. containers(operation="preflight")              # Verify Docker/Podman ready
+2. containers(operation="create", purpose="python") # Create environment
+3. containers(operation="exec", container="...", command="...")  # Work inside it
+4. containers(operation="exec_interactive_hint", container="...")  # Hand off to user
+5. containers(operation="destroy", container="...")  # Clean up when done
+```
+
+## Key Operations
+
+| Operation | Use For |
+|-----------|---------|
+| `preflight` | Check if container runtime is ready (auto-runs before first create) |
+| `create` | Create a new container with smart defaults |
+| `exec` | Run a command inside a container |
+| `exec_interactive_hint` | Get the shell command for user to connect |
+| `list` | Show all managed containers |
+| `status` | Detailed container status |
+| `destroy` | Remove a container |
+| `destroy_all` | Remove all managed containers |
+| `copy_in` / `copy_out` | Transfer files between host and container |
+| `snapshot` / `restore` | Save and restore container state |
+
+## The `purpose` Parameter
+
+Use `purpose` on `create` to get smart defaults instead of specifying everything:
+
+| Purpose | What You Get |
+|---------|-------------|
+| `"python"` | Python 3.12 + uv + venv |
+| `"node"` | Node 20 + corepack |
+| `"rust"` | Rust toolchain + build tools |
+| `"go"` | Go 1.22 toolchain |
+| `"general"` | Ubuntu 24.04 + common dev tools |
+| `"amplifier"` | Python + Amplifier pre-installed + all credentials forwarded |
+| `"try-repo"` | Auto-detect language from repo, clone and set up |
+| `"clean"` | Pristine environment — no dotfiles, no credential forwarding |
+
+## Convenience Features (on `create`)
+
+These make the container feel like home with zero effort:
+
+| Parameter | Default | What It Does |
+|-----------|---------|-------------|
+| `env_passthrough` | `"auto"` | Forwards API keys matching common patterns |
+| `forward_git` | `true` | Copies .gitconfig so git works naturally |
+| `forward_gh` | `true` | Forwards GH CLI auth for private repos |
+| `forward_ssh` | `false` | Mounts ~/.ssh read-only (opt-in) |
+| `dotfiles_repo` | config | Clones and runs a dotfiles install script |
+| `mount_cwd` | `true` | Mounts current directory into /workspace |
+
+## Patterns
+
+### Agent Puppet Mode
+Create container, work inside it, report results:
+```
+create -> exec (multiple commands) -> report to user -> destroy
+```
+
+### User Handoff Mode
+Create container, set it up, give user the connect command:
+```
+create -> exec (setup) -> exec_interactive_hint -> tell user the command
+```
+
+### Hybrid Mode
+Set up for user, user works, agent assists further:
+```
+create -> exec (setup) -> hand off -> user works -> user asks for help -> exec
+```
+
+## Important
+
+- Always provide `exec_interactive_hint` output when handing a container to the user
+- Use `purpose` to let the tool choose smart defaults — don't over-specify
+- Containers are ephemeral by default — destroyed on session end
+- Set `persistent=true` if the container should survive session restarts
+- For complex multi-container setups, delegate to the `container-operator` agent

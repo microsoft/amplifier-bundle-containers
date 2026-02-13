@@ -1,0 +1,48 @@
+bundle:
+  name: behavior-containers
+  version: 0.1.0
+  description: Container management for isolated environments
+
+tools:
+  - module: tool-containers
+    source: "containers:modules/tool-containers"
+    config:
+      default_image: "ubuntu:24.04"
+      max_containers: 10
+      auto_passthrough:
+        env_patterns:
+          - "*_API_KEY"
+          - "*_TOKEN"
+          - "ANTHROPIC_*"
+          - "OPENAI_*"
+          - "AZURE_OPENAI_*"
+          - "GOOGLE_*"
+          - "GEMINI_*"
+          - "OLLAMA_*"
+          - "AMPLIFIER_*"
+          - "HTTP_PROXY"
+          - "HTTPS_PROXY"
+          - "NO_PROXY"
+        forward_git: true
+        forward_gh: true
+        forward_ssh: false
+      dotfiles:
+        repo: null
+        script: null
+        branch: null
+        target: "~/.dotfiles"
+      security:
+        allow_privileged: false
+        allow_host_network: false
+        cap_drop:
+          - "ALL"
+        memory_limit: "4g"
+        pids_limit: 256
+
+agents:
+  include:
+    - containers:agents/container-operator
+
+context:
+  include:
+    - containers:context/container-awareness.md
