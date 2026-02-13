@@ -19,6 +19,9 @@ Before starting implementation:
 
 ## Phase 1: Core MVP
 
+> **Phase 1 Status**: COMPLETE — All tasks implemented and tested (54 tests passing).
+> Kept here as reference for patterns and implementation details.
+
 > Goal: Basic container lifecycle works end-to-end. An assistant can create a container, run commands in it, and destroy it, with env var passthrough and git config forwarding.
 
 ### Task 1.1: Bundle Skeleton and Packaging
@@ -713,484 +716,548 @@ async def execute(self, tool_name: str, tool_input: dict) -> Any:
 
 ---
 
-## Phase 2: Convenience
+---
 
-> Goal: Full identity forwarding (GH, SSH, dotfiles), purpose-based smart defaults, interactive handoff, snapshots, specialist agent, and safety hooks.
+## Phase 2: Production Readiness
 
-### Task 2.1: GH CLI Auth Forwarding
+> Goal: Fix implementation learnings from Phase 1 and add the features that make containers truly useful day-to-day: proper file ownership, visibility into what happened during setup, faster startup, try-repo auto-detection, and non-blocking long commands.
 
-**What**: Forward GitHub CLI authentication into containers.
+### Task 2.1: Development Infrastructure
 
-**Add to `provisioner.py`**:
+**What**: Root-level pyproject.toml for dev dependencies and proper pytest configuration.
 
-```python
-async def provision_gh_auth(self, container: str, lifecycle: ContainerLifecycle) -> ProvisionResult:
-    """Forward GH CLI authentication into the container."""
+**Files to create/modify**:
+- `pyproject.toml` (root) — Dev dependencies and pytest configuration
+
+**Root `pyproject.toml`**:
+```toml
+[project]
+name = "amplifier-bundle-containers"
+version = "0.1.0"
+description = "Container management bundle for Amplifier"
+requires-python = ">=3.11"
+license = "MIT"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "integration: tests requiring Docker/Podman (deselect with '-m not integration')",
+]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.pyright]
+pythonVersion = "3.11"
 ```
 
-**Implementation**:
-1. Check if `gh` CLI is available on host: `shutil.which("gh")`
-2. If not, skip with informational message (not an error)
-3. Extract token: `gh auth token` — capture stdout
-4. If token extraction fails (not logged in), skip with guidance
-5. Write `GH_TOKEN` and `GITHUB_TOKEN` env vars into container's env file
-6. Check if `gh` is installed in container (`which gh`)
-7. If yes, run `gh auth login --with-token` for full `gh` integration
-8. If no, the env var alone enables `git clone` of private repos via HTTPS
+**Modify `tests/conftest.py`**: Add sys.path setup so pytest discovers the module without hacking:
+```python
+import sys
+from pathlib import Path
 
-**Security notes**:
-- Token goes into the container's `/tmp/.amplifier_env` file and `.bashrc`
-- Container is ephemeral by default — token dies with container
-- Same security scope as the host — user already has this token
-- Add to `metadata.json` provisioning record (flag only, NOT the token value)
+# Add tool module to sys.path for test discovery
+sys.path.insert(0, str(Path(__file__).parent.parent / "modules" / "tool-containers"))
+```
 
-**Tests**:
-- `test_gh_auth_forward_success` — token extracted and injected
-- `test_gh_auth_no_gh_cli` — gracefully skips, returns informational result
-- `test_gh_auth_not_logged_in` — gracefully skips with login guidance
-- `test_gh_auth_with_gh_in_container` — runs `gh auth login --with-token`
-- `test_gh_auth_without_gh_in_container` — just sets env vars
-- Integration test: `gh auth status` works inside container
+**Tests**: Run `pytest tests/ -v` — all 54 existing tests should still pass.
 
-**Done when**: Private repo cloning works inside the container via GH token forwarding.
+**Done when**: `pytest` works from repo root without sys.path hacks in individual test files. Integration marker registered (no warning).
 
 ---
 
-### Task 2.2: SSH Key Forwarding
+### Task 2.2: Host UID/GID Mapping
 
-**What**: Opt-in bind-mount of SSH keys into containers.
+**What**: Default to host user's UID/GID when mounting volumes, so files created in the container have correct ownership on the host.
 
-**Add to `provisioner.py`**:
+**Files to modify**:
+- `modules/tool-containers/amplifier_module_tool_containers/__init__.py` — `_op_create` method
 
+**Changes**:
+
+1. Add `user` parameter to `CreateParams` dataclass:
 ```python
-async def provision_ssh(self, container: str, lifecycle: ContainerLifecycle) -> ProvisionResult:
-    """Mount SSH directory into container (read-only)."""
+user: str | None = None  # Default: auto-detect host UID:GID
 ```
 
-**Implementation note**: Unlike git/gh forwarding which happens after container creation, SSH forwarding must happen at container creation time as a bind mount (`-v ~/.ssh:/home/user/.ssh:ro`). So this modifies `CreateParams` before the `docker run` command.
+2. In `_op_create`, compute user mapping:
+```python
+import os
 
-**Flow**:
-1. Check if `~/.ssh` exists on host
-2. Add `-v {home}/.ssh:/root/.ssh:ro` to create params (adjust target user path)
-3. After container starts, fix permissions:
-   - `chmod 700 /root/.ssh`
-   - `chmod 600 /root/.ssh/id_*` (ignore errors for files that don't exist)
-   - `chmod 644 /root/.ssh/*.pub` (public keys can be readable)
-   - `chmod 644 /root/.ssh/known_hosts`
-4. Verify with `ssh -T git@github.com` (should get "Hi username" even if exit code is 1)
+# Default to host UID:GID for proper file ownership on mounted volumes
+if inp.get("user") is None and inp.get("mount_cwd", True):
+    uid = os.getuid()
+    gid = os.getgid()
+    user_flag = f"{uid}:{gid}"
+else:
+    user_flag = inp.get("user")  # Explicit override or None (root)
+
+if user_flag:
+    args.extend(["--user", user_flag])
+```
+
+3. Update all provisioning methods to detect the home directory inside the container instead of hardcoding `/root/`:
+```python
+async def _get_container_home(self, container: str) -> str:
+    """Get the home directory of the container user."""
+    result = await self.runtime.run(
+        "exec", container, "/bin/sh", "-c", "echo $HOME", timeout=5
+    )
+    home = result.stdout.strip()
+    return home if home else "/root"
+```
+
+4. Replace all hardcoded `/root/` paths in `_provision_git`, `_provision_gh_auth`, `_fix_ssh_permissions`, `_provision_dotfiles`, `_provision_dotfiles_inline` with calls to `_get_container_home()`.
+
+5. Add `user` to the tool's input_schema properties:
+```python
+"user": {"type": "string", "description": "Container user (default: host UID:GID for mounted volumes, 'root' for root access)"},
+```
+
+**Edge cases**:
+- When `mount_cwd=False` and no explicit mounts, skip UID mapping (no volume permission issues)
+- When `user="root"` is explicitly set, use root (some purpose profiles may need this)
+- The `--user` flag means the container user may not have a proper home dir — use `HOME` env var detection
+- SSH bind mount with non-root user: permissions may differ, test carefully
 
 **Tests**:
-- `test_ssh_mount_added_to_create` — bind mount flag present in docker run args
-- `test_ssh_permissions_fixed` — correct chmod calls made
-- `test_ssh_no_ssh_dir` — gracefully skips
-- `test_ssh_read_only` — mount is :ro
-- Integration test: `ssh -T git@github.com` works inside container (if host has SSH keys)
+- `test_uid_gid_mapping_default` — when mount_cwd=True, --user flag added with host UID:GID
+- `test_uid_gid_mapping_no_mount` — when mount_cwd=False and no mounts, no --user flag
+- `test_uid_gid_mapping_explicit_root` — user="root" overrides default mapping
+- `test_uid_gid_mapping_explicit_user` — user="1000:1000" used as-is
+- `test_provisioning_uses_container_home` — provisioning paths adapt to non-root home
+- Integration: create with mount_cwd, touch a file inside /workspace, verify host ownership matches current user
 
-**Done when**: SSH key forwarding works with read-only mount and correct permissions.
+**Done when**: Files created inside mounted volumes have correct host user ownership by default.
 
 ---
 
-### Task 2.3: Purpose Profiles
+### Task 2.3: Provisioning Report
 
-**What**: Smart default selection based on intended purpose.
+**What**: Return a structured report from `create` showing the status of each provisioning step, so the caller doesn't need to investigate.
 
-**File**: `modules/tool-containers/amplifier_module_tool_containers/images.py`
+**Files to modify**:
+- `modules/tool-containers/amplifier_module_tool_containers/__init__.py`
 
-```python
-class PurposeResolver:
-    """Resolves purpose hints into container configuration."""
+**Changes**:
 
-    PROFILES: dict[str, PurposeProfile] = { ... }
-
-    def resolve(self, purpose: str, explicit_params: dict) -> ResolvedConfig:
-        """Merge purpose defaults with explicit parameters. Explicit wins."""
-```
-
-**`PurposeProfile` dataclass**:
+1. Define a `ProvisioningStep` structure:
 ```python
 @dataclass
-class PurposeProfile:
-    image: str
-    packages: list[str] = field(default_factory=list)  # apt packages to install
-    setup_commands: list[str] = field(default_factory=list)
-    env: dict[str, str] = field(default_factory=dict)
-    forward_git: bool = True
-    forward_gh: bool = True
-    forward_ssh: bool = False
-    dotfiles: bool = True  # Apply dotfiles if configured
+class ProvisioningStep:
+    name: str
+    status: str  # "success", "skipped", "failed", "partial"
+    detail: str
+    error: str | None = None
 ```
 
-**Profiles to implement**:
-- `python`: python:3.12-slim, install uv, create venv
-- `node`: node:20-slim, enable corepack
-- `rust`: rust:1-slim, build-essential, pkg-config, libssl-dev
-- `go`: golang:1.22, go toolchain ready
-- `general`: ubuntu:24.04, build-essential, git, curl, jq, tree, vim-tiny
-- `amplifier`: python:3.12-slim, uv tool install amplifier, auto-forward all creds
-- `clean`: ubuntu:24.04, NO dotfiles, NO forwarding
+2. Each provisioning method returns a `ProvisioningStep` instead of silently succeeding/failing:
+```python
+async def _provision_git(self, container: str) -> ProvisioningStep:
+    """Copy git configuration into the container."""
+    home = Path.home()
+    gitconfig = home / ".gitconfig"
+    if not gitconfig.exists():
+        return ProvisioningStep("forward_git", "skipped", "No .gitconfig found on host")
+    
+    # ... do the work ...
+    
+    return ProvisioningStep("forward_git", "success", "Copied .gitconfig, known_hosts")
+```
 
-**Merge behavior**: Explicit parameters always override purpose defaults. Purpose only fills in what wasn't specified.
+3. `_op_create` collects all steps into the report:
+```python
+report = []
+if inp.get("forward_git", True):
+    report.append(await self._provision_git(name))
+else:
+    report.append(ProvisioningStep("forward_git", "skipped", "Not requested"))
 
-**Integration with create flow**:
-1. If `purpose` is provided, resolve profile
-2. Merge profile defaults with explicit params
-3. Proceed with merged params
+# ... same for gh, ssh, dotfiles, purpose setup, setup_commands ...
+
+# Include in result
+return {
+    "success": True,
+    "container": name,
+    "provisioning_report": [
+        {"name": s.name, "status": s.status, "detail": s.detail, "error": s.error}
+        for s in report
+    ],
+    # ... other fields ...
+}
+```
+
+4. For `setup_commands`, track each command individually:
+```python
+cmd_results = []
+for i, cmd in enumerate(setup_commands):
+    result = await self.runtime.run("exec", container, "/bin/sh", "-c", cmd, timeout=300)
+    if result.returncode != 0:
+        cmd_results.append({"command": cmd, "status": "failed", "error": result.stderr.strip()})
+    else:
+        cmd_results.append({"command": cmd, "status": "success"})
+
+all_ok = all(r["status"] == "success" for r in cmd_results)
+report.append(ProvisioningStep(
+    "setup_commands",
+    "success" if all_ok else "partial",
+    f"{sum(1 for r in cmd_results if r['status'] == 'success')}/{len(cmd_results)} commands succeeded",
+    error=None if all_ok else str([r for r in cmd_results if r["status"] == "failed"]),
+))
+```
 
 **Tests**:
-- `test_resolve_python` — correct image, uv setup
-- `test_resolve_amplifier` — correct image, amplifier install, creds forwarded
-- `test_resolve_clean` — no forwarding, no dotfiles
-- `test_explicit_overrides_purpose` — explicit image beats purpose default
-- `test_unknown_purpose` — returns error or falls back to general
-- `test_purpose_packages_installed` — setup_commands include apt install
+- `test_report_all_success` — all provisioning steps report success
+- `test_report_git_skipped` — forward_git=False shows skipped
+- `test_report_git_no_config` — no .gitconfig shows skipped with detail
+- `test_report_gh_not_installed` — no gh CLI shows skipped with guidance
+- `test_report_setup_command_failure` — partial status when some commands fail
+- `test_report_dotfiles_clone_failed` — failed status with error detail
+- Integration: create with forward_git=True on a machine with .gitconfig, verify report shows success
 
-**Done when**: `containers(create, purpose="python")` creates a Python-ready container with uv and venv.
+**Done when**: Every `create` returns a provisioning report. The caller never needs to `exec` into the container to check if credentials were set up correctly.
 
 ---
 
-### Task 2.4: Dotfiles Integration
+### Task 2.4: Local Image Caching
 
-**What**: Clone a dotfiles repo into containers and run the install script.
+**What**: Cache provisioned container state locally to avoid repeating slow package installs on subsequent creates with the same purpose.
 
-**Add to `provisioner.py`**:
+**Files to modify/create**:
+- `modules/tool-containers/amplifier_module_tool_containers/__init__.py`
+- `modules/tool-containers/amplifier_module_tool_containers/images.py`
 
+**How it works**:
+
+1. After a successful `create` with a purpose profile, commit the container state as a local cached image:
 ```python
-async def provision_dotfiles(
-    self,
-    container: str,
-    lifecycle: ContainerLifecycle,
-    repo: str | None = None,
-    script: str | None = None,
-    branch: str | None = None,
-    target: str = "~/.dotfiles",
-    inline: dict[str, str] | None = None,
-    skip: bool = False,
-) -> ProvisionResult:
-    """Clone and apply dotfiles from a git repo or inline content."""
+cache_tag = f"amplifier-cache:{purpose}"
+await self.runtime.run("commit", container_name, cache_tag, timeout=120)
 ```
 
-**Flow for repo-based dotfiles**:
-1. If `skip=True` or no repo configured, skip
-2. Clone repo into container: `git clone [--branch {branch}] {repo} {target}`
-   - This runs AFTER gh/ssh forwarding, so private repos work
-3. Find install script (resolution order): explicit > install.sh > setup.sh > bootstrap.sh > script/setup > Makefile > smart-symlink
-4. Run the install script: `cd {target} && ./{script}` or `cd {target} && make`
-5. Return result with script output
-
-**Flow for inline dotfiles**:
-1. For each `{path: content}` in `inline` dict:
-2. Write file to container at `~/{path}` via `docker exec sh -c "cat > ~/path << 'DOTEOF'\n{content}\nDOTEOF"`
-
-**Smart-symlink fallback** (when no install script found):
+2. On subsequent creates with the same purpose, check for the cached image first:
 ```python
-COMMON_DOTFILES = [
-    ".bashrc", ".bash_profile", ".bash_aliases",
-    ".zshrc", ".zprofile",
-    ".gitconfig", ".gitignore_global",
-    ".vimrc", ".tmux.conf",
-    ".inputrc", ".editorconfig",
+async def _get_cached_image(self, purpose: str) -> str | None:
+    """Check if a locally cached image exists for this purpose."""
+    cache_tag = f"amplifier-cache:{purpose}"
+    result = await self.runtime.run(
+        "image", "inspect", cache_tag, timeout=10
+    )
+    if result.returncode == 0:
+        return cache_tag
+    return None
+```
+
+3. When a cached image is found, skip the package install setup_commands from the purpose profile (they're already baked in). Still run: env provisioning, credential forwarding, dotfiles, user's explicit setup_commands.
+
+4. Add `cache_bust` parameter to force a fresh build:
+```python
+"cache_bust": {"type": "boolean", "default": False, "description": "Ignore cached image, build fresh"},
+```
+
+5. Add `cache_clear` operation to remove cached images:
+```python
+async def _op_cache_clear(self, inp: dict) -> dict:
+    """Remove locally cached purpose images."""
+    purpose = inp.get("purpose")  # Optional: clear specific or all
+    if purpose:
+        await self.runtime.run("rmi", f"amplifier-cache:{purpose}", timeout=15)
+    else:
+        # List and remove all amplifier-cache:* images
+        ...
+```
+
+**Cache invalidation**: Cached images should include a version label so we can detect when the purpose profile definition has changed:
+```python
+# When committing cache:
+labels = {"amplifier.cache.version": hashlib.md5(str(profile).encode()).hexdigest()[:8]}
+```
+
+**Tests**:
+- `test_cache_created_after_purpose_create` — cache image exists after first create
+- `test_cache_used_on_second_create` — second create with same purpose uses cached image
+- `test_cache_bust_ignores_cache` — cache_bust=True forces fresh build
+- `test_cache_clear_specific` — removes one cached image
+- `test_cache_clear_all` — removes all cached images
+- `test_cache_not_created_without_purpose` — no caching for purposeless creates
+- Integration: first create with purpose="general" is slow (installs packages), second create is fast
+
+**Done when**: Second container creation with the same purpose is significantly faster than the first.
+
+---
+
+### Task 2.5: Try-Repo Auto-Detection
+
+**What**: The `"try-repo"` purpose inspects a repository to choose the right profile, clones it into the container, and runs setup.
+
+**Files to modify**:
+- `modules/tool-containers/amplifier_module_tool_containers/images.py`
+- `modules/tool-containers/amplifier_module_tool_containers/__init__.py`
+
+**Add to images.py**:
+```python
+# Detection rules in priority order
+REPO_MARKERS = [
+    ("Cargo.toml", "rust"),
+    ("pyproject.toml", "python"),
+    ("setup.py", "python"),
+    ("requirements.txt", "python"),
+    ("package.json", "node"),
+    ("go.mod", "go"),
 ]
 
-# For each that exists in dotfiles repo, symlink to ~/
+async def detect_repo_purpose(runtime, repo_url: str) -> tuple[str, list[str]]:
+    """Shallow clone repo on HOST, inspect files, return (purpose, setup_hints).
+    
+    Returns purpose string and optional setup commands specific to the repo.
+    """
 ```
 
-**Tests**:
-- `test_dotfiles_clone_public_repo` — clones and runs install.sh
-- `test_dotfiles_clone_private_repo` — works when gh auth is forwarded
-- `test_dotfiles_script_resolution` — picks correct script from resolution order
-- `test_dotfiles_inline` — writes inline content correctly
-- `test_dotfiles_smart_symlink` — fallback when no script found
-- `test_dotfiles_skip` — skip=True does nothing
-- `test_dotfiles_no_repo_configured` — gracefully skips
-- `test_dotfiles_script_failure` — returns error but doesn't fail container creation
+**Detection flow**:
+1. Shallow clone on the HOST into a temp directory: `git clone --depth=1 {repo_url} {tmpdir}`
+2. Inspect files against REPO_MARKERS
+3. Generate repo-specific setup hints:
+   - If `pyproject.toml` exists: `pip install -e ".[dev]"` or `uv pip install -e ".[dev]"`
+   - If `package.json` exists: `npm install`
+   - If `Cargo.toml` exists: `cargo build`
+   - If `Makefile` exists: add `make` as a hint
+4. Clean up temp directory
+5. Return (purpose, setup_hints)
 
-**Done when**: Dotfiles integration works for both repo-based and inline approaches. Private repos work when GH auth is forwarded.
-
----
-
-### Task 2.5: Snapshot and Restore
-
-**What**: Save container state as named images and create containers from snapshots.
-
-**Add to `lifecycle.py`**:
-
+**Add `repo_url` to create params and tool schema**:
 ```python
-async def snapshot(self, container: str, snapshot_name: str) -> SnapshotResult:
-    """Commit container state as a new image."""
-
-async def restore(self, snapshot_name: str, container_name: str | None = None, **kwargs) -> CreateResult:
-    """Create a new container from a saved snapshot."""
-
-async def list_snapshots(self) -> list[SnapshotInfo]:
-    """List all saved snapshots."""
-
-async def delete_snapshot(self, snapshot_name: str) -> None:
-    """Remove a saved snapshot image."""
+"repo_url": {"type": "string", "description": "Git URL to clone (used with purpose='try-repo')"},
 ```
 
-**Snapshot implementation**:
-1. `docker commit {container} amplifier-snapshot:{snapshot_name}`
-2. Save snapshot metadata to `~/.amplifier/containers/snapshots/{name}.json`
-3. Return image ID and name
-
-**Restore implementation**:
-1. Create container with `image=amplifier-snapshot:{snapshot_name}` instead of stock image
-2. All other create params work normally (mounts, ports, env, etc.)
-
-**Tests**:
-- `test_snapshot_creates_image` — docker commit called correctly
-- `test_restore_uses_snapshot_image` — create uses snapshot image
-- `test_list_snapshots` — returns saved snapshots
-- `test_delete_snapshot` — removes image
-- Integration: snapshot, destroy original, restore, verify state preserved
-
-**Done when**: Users can save checkpoints of container state and restore from them.
-
----
-
-### Task 2.6: Container Operator Agent
-
-**What**: Specialist agent for complex container orchestration.
-
-**File**: `agents/container-operator.md`
-
-**Agent responsibilities**:
-- Multi-container setup and coordination
-- Troubleshooting container issues
-- Complex provisioning workflows
-- Service stack orchestration
-
-**Agent gets**:
-- The `tool-containers` module (declared in its frontmatter)
-- Heavy context via `@containers:context/container-guide.md`
-- Knowledge of all purpose profiles, all provisioning options, troubleshooting guides
-
-**File**: `context/container-guide.md`
-
-**Heavy context contents** (~200-300 lines):
-- Full operation reference with all parameters
-- Purpose profile details
-- Dotfiles integration patterns
-- Multi-container networking patterns
-- Troubleshooting guide (common errors and fixes)
-- Security model explanation
-- Best practices for provisioning order
-- The three interaction modes (puppet, handoff, hybrid)
-
-**Tests**: N/A (agent + context docs)
-
-**Done when**: Delegating to `container-operator` for "set up a full-stack dev environment with Postgres, Redis, and my app" produces a working multi-container setup.
-
----
-
-### Task 2.7: Container Safety Hooks (Optional Behavior)
-
-**What**: Approval gates for dangerous container operations.
-
-**Files**:
-- `behaviors/container-safety.yaml` — Optional behavior declaring the hook
-- `modules/hooks-container-safety/pyproject.toml` — Module package
-- `modules/hooks-container-safety/amplifier_module_hooks_container_safety/__init__.py` — Hook implementation
-
-**Hook events to intercept**:
-- `tool:pre` on `containers` tool — inspect the operation parameters
-
-**Approval-required scenarios**:
-- `create` with `gpu=True`
-- `create` with `network="host"`
-- `create` with mounts to sensitive paths (`/`, `/etc`, `/var`, `/root`, `/home`)
-- `create` with `forward_ssh=True`
-- `env_passthrough="all"`
-- `destroy_all`
-
-**Session cleanup**:
-- `session:end` event — destroy all non-persistent containers from this session
-
-**Max containers limit**:
-- Track container count per session
-- Deny `create` if `max_containers_per_session` exceeded
-
-**`behaviors/container-safety.yaml`**:
-```yaml
-bundle:
-  name: behavior-container-safety
-  version: 0.1.0
-  description: Safety policies for container operations
-
-hooks:
-  - module: hooks-container-safety
-    source: "containers:modules/hooks-container-safety"
-    config:
-      require_approval_for:
-        - gpu_access
-        - host_network
-        - sensitive_mounts
-        - ssh_forwarding
-        - all_env_passthrough
-        - destroy_all
-      auto_cleanup_on_session_end: true
-      max_containers_per_session: 10
+**Modify `_op_create` for try-repo**:
+```python
+if purpose == "try-repo":
+    repo_url = inp.get("repo_url")
+    if not repo_url:
+        return {"error": "repo_url is required when purpose is 'try-repo'"}
+    detected_purpose, setup_hints = await detect_repo_purpose(self.runtime, repo_url)
+    inp["purpose"] = detected_purpose
+    # Add clone + setup to setup_commands
+    inp.setdefault("setup_commands", [])
+    inp["setup_commands"] = [
+        f"git clone {repo_url} /workspace/repo",
+        "cd /workspace/repo",
+    ] + setup_hints + inp["setup_commands"]
 ```
 
 **Tests**:
-- `test_hook_blocks_privileged` — approval required for GPU
-- `test_hook_blocks_host_network` — approval required for host network
-- `test_hook_blocks_sensitive_mount` — approval required for /etc mount
-- `test_hook_allows_normal_create` — normal create passes through
-- `test_hook_session_cleanup` — containers destroyed on session end
-- `test_hook_max_containers` — denies create beyond limit
+- `test_detect_python_pyproject` — pyproject.toml triggers python purpose
+- `test_detect_node_package_json` — package.json triggers node
+- `test_detect_rust_cargo` — Cargo.toml triggers rust
+- `test_detect_go_mod` — go.mod triggers go
+- `test_detect_fallback_general` — no markers triggers general
+- `test_detect_priority_order` — Cargo.toml wins over package.json if both exist
+- `test_try_repo_requires_url` — error if repo_url missing
+- `test_try_repo_adds_clone_command` — setup_commands include git clone
+- Integration: create with purpose="try-repo" and a real public GitHub repo, verify repo cloned inside container
 
-**Done when**: Safety hook behavior works as an optional overlay. Including it adds approval gates without changing the core tool behavior.
-
----
-
-## Phase 3: Multi-Container
-
-> Goal: Support service stacks, container networking, compose pass-through, and Amplifier-in-container.
-
-### Task 3.1: Network Management
-
-**What**: Create and manage Docker networks for container-to-container communication.
-
-**Add operations to tool**:
-- `create_network(name)` — `docker network create {name}`
-- `destroy_network(name)` — `docker network rm {name}`
-- `list_networks()` — `docker network ls --filter label=amplifier.managed=true`
-
-**Modify `create`**: Accept `network` parameter as either:
-- `"bridge"` (default) — standard isolated network
-- Named network — attach to existing network created by `create_network`
-
-**Track networks** in metadata store alongside containers.
-
-**Tests**:
-- `test_create_network` — network created with labels
-- `test_create_on_named_network` — container attached to named network
-- `test_container_name_resolution` — containers on same network can reach each other by name
-- `test_destroy_network` — network removed, handles in-use error
-- Integration: two containers on same network, one curls the other
-
-**Done when**: Service stacks work — containers on the same network can communicate by name.
+**Done when**: `containers(create, purpose="try-repo", repo_url="https://github.com/user/repo")` auto-detects the language, creates the right container, and clones the repo.
 
 ---
 
-### Task 3.2: Docker Compose Pass-Through
+### Task 2.6: Background Execution with Polling
 
-**What**: Support `compose_up` and `compose_down` for users with existing compose files.
+**What**: Run long commands without blocking the tool. Agent can start a build and check on it later.
+
+**Files to modify**:
+- `modules/tool-containers/amplifier_module_tool_containers/__init__.py`
 
 **Add operations**:
-- `compose_up(compose_file, project_name=None)` — `docker compose -f {file} [-p {name}] up -d`
-- `compose_down(project_name)` — `docker compose [-p {name}] down`
-- `compose_status(project_name)` — `docker compose [-p {name}] ps --format json`
+- `exec_background` — Start a command in the background, return a job ID
+- `exec_poll` — Check status and get partial output of a background job
+- `exec_cancel` — Kill a background job
 
-**Implementation notes**:
-- Detect `docker compose` vs `docker-compose` (old standalone)
-- Add standard labels to compose project for tracking
-- Track compose projects in metadata store
+**Implementation**:
+```python
+async def _op_exec_background(self, inp: dict) -> dict:
+    container = inp["container"]
+    command = inp["command"]
+    job_id = uuid.uuid4().hex[:8]
+    
+    # Run command with nohup, redirect output to a temp file, capture PID
+    bg_cmd = (
+        f"nohup /bin/sh -c '{command}' "
+        f"> /tmp/amp-job-{job_id}.out 2>&1 & "
+        f"echo $!"
+    )
+    result = await self.runtime.run("exec", container, "/bin/sh", "-c", bg_cmd, timeout=10)
+    pid = result.stdout.strip()
+    
+    return {"job_id": job_id, "pid": pid, "container": container, "command": command}
+
+async def _op_exec_poll(self, inp: dict) -> dict:
+    container = inp["container"]
+    job_id = inp["job_id"]
+    
+    # Check if process is still running
+    pid_check = await self.runtime.run(
+        "exec", container, "/bin/sh", "-c",
+        f"kill -0 $(cat /tmp/amp-job-{job_id}.pid 2>/dev/null) 2>/dev/null && echo running || echo done",
+        timeout=5,
+    )
+    running = "running" in pid_check.stdout
+    
+    # Get output (tail for partial, cat for complete)
+    output = await self.runtime.run(
+        "exec", container, "/bin/sh", "-c",
+        f"tail -100 /tmp/amp-job-{job_id}.out 2>/dev/null",
+        timeout=5,
+    )
+    
+    # Get exit code if done
+    exit_code = None
+    if not running:
+        ec = await self.runtime.run(
+            "exec", container, "/bin/sh", "-c",
+            f"cat /tmp/amp-job-{job_id}.exit 2>/dev/null",
+            timeout=5,
+        )
+        exit_code = int(ec.stdout.strip()) if ec.stdout.strip().isdigit() else None
+    
+    return {
+        "job_id": job_id,
+        "running": running,
+        "output": output.stdout,
+        "exit_code": exit_code,
+    }
+
+async def _op_exec_cancel(self, inp: dict) -> dict:
+    container = inp["container"]
+    job_id = inp["job_id"]
+    
+    await self.runtime.run(
+        "exec", container, "/bin/sh", "-c",
+        f"kill $(cat /tmp/amp-job-{job_id}.pid 2>/dev/null) 2>/dev/null",
+        timeout=5,
+    )
+    return {"job_id": job_id, "cancelled": True}
+```
+
+**Update the background command to save PID and exit code**:
+```python
+bg_cmd = (
+    f"(/bin/sh -c '{command}'; echo $? > /tmp/amp-job-{job_id}.exit) "
+    f"> /tmp/amp-job-{job_id}.out 2>&1 & "
+    f"echo $! > /tmp/amp-job-{job_id}.pid && cat /tmp/amp-job-{job_id}.pid"
+)
+```
+
+**Add to tool_definitions operation enum**: `"exec_background"`, `"exec_poll"`, `"exec_cancel"`
+
+**Add to input_schema**:
+```python
+"job_id": {"type": "string", "description": "Background job ID (for exec_poll/exec_cancel)"},
+```
 
 **Tests**:
-- `test_compose_up` — starts services from compose file
-- `test_compose_down` — stops and removes services
-- `test_compose_status` — lists running services
-- Integration: create a simple compose file (nginx + redis), bring up, verify, tear down
+- `test_exec_background_returns_job_id` — returns a job_id string
+- `test_exec_poll_running` — reports running=True while command executes
+- `test_exec_poll_completed` — reports running=False with exit_code after completion
+- `test_exec_poll_output` — returns partial output
+- `test_exec_cancel` — kills the background process
+- Integration: start `sleep 5` in background, poll shows running, wait, poll shows done
 
-**Done when**: Users with existing docker-compose.yml files can use them through the tool.
+**Done when**: Agent can start a long-running command, do other work, and check back for results.
 
 ---
 
-### Task 3.3: Amplifier-in-Container Purpose Profile
+### Task 2.7: Integration Tests for Phase 2 Features
 
-**What**: Polish the `"amplifier"` purpose profile for running Amplifier inside containers.
+**What**: Integration tests covering UID mapping, provisioning report, image caching, try-repo, and background exec.
 
-**Enhanced amplifier profile**:
-1. Base: python:3.12-slim + git + curl + jq
-2. Install uv: `pip install uv`
-3. Install amplifier: `uv tool install amplifier` (or specific version)
-4. Forward ALL credential types: API keys, git, GH auth
-5. Forward amplifier settings if they exist: `~/.amplifier/settings.yaml`
-6. Set up proper PATH for uv tools
+**File**: `tests/integration/test_phase2.py`
 
-**Additional create parameter** (amplifier-specific):
-- `amplifier_bundle` — optional bundle name/URI to configure inside the container
-- `amplifier_settings` — optional, forward host's amplifier settings
+**Tests**:
+1. `test_uid_mapping_file_ownership` — create with mount_cwd, write file inside container, verify host file owned by current user
+2. `test_provisioning_report_present` — create returns provisioning_report with expected steps
+3. `test_provisioning_report_git_success` — forward_git step shows success when .gitconfig exists
+4. `test_image_cache_speedup` — first purpose create is slower, second is faster (check for cache image existence)
+5. `test_try_repo_public` — create with purpose="try-repo" and a known public repo (e.g., a small test fixture repo), verify repo cloned inside
+6. `test_background_exec_lifecycle` — exec_background, poll while running, poll after done, verify exit code
+7. `test_dotfiles_integration` — create with dotfiles_inline, verify files exist in container
+
+**Done when**: All Phase 2 integration tests pass alongside the 54 existing tests.
+
+---
+
+## Phase 3: Amplifier-in-Container
+
+> Goal: Polish the amplifier purpose profile and multi-container orchestration for the parallel-agents use case.
+
+### Task 3.1: Amplifier Purpose Profile Polish
+
+**What**: Make `purpose="amplifier"` production-ready for running Amplifier inside containers.
+
+**Enhanced profile**:
+1. Forward `~/.amplifier/settings.yaml` if it exists
+2. Forward `~/.amplifier/settings.local.yaml` if it exists
+3. Accept `amplifier_bundle` parameter — bundle name/URI to configure inside the container
+4. Accept `amplifier_version` parameter — pin amplifier version (default: latest)
+5. Set up proper PATH for `uv tool` binaries
+
+**Additional create parameters**:
+```python
+"amplifier_bundle": {"type": "string", "description": "Bundle to configure inside the container"},
+"amplifier_version": {"type": "string", "description": "Amplifier version to install (default: latest)"},
+```
 
 **Tests**:
 - `test_amplifier_profile_installs_amplifier` — amplifier CLI available inside container
-- `test_amplifier_profile_forwards_creds` — all API keys passed through
 - `test_amplifier_profile_forwards_settings` — settings.yaml copied
-- Integration: create amplifier container, run `amplifier run "echo hello"`, verify output
+- `test_amplifier_profile_custom_bundle` — bundle configured inside container
+- Integration: create amplifier container, run `amplifier --version`, verify output
 
-**Done when**: `containers(create, purpose="amplifier")` produces a container where `amplifier run "do something"` just works.
-
----
-
-## Phase 4: Polish
-
-> Goal: Auto-detection, curated images, background execution, GPU support.
-
-### Task 4.1: Try-Repo Auto-Detection
-
-**What**: The `"try-repo"` purpose inspects a repository to choose the right profile.
-
-**Add to `images.py`**:
-
-```python
-async def detect_repo_purpose(self, repo_url: str, lifecycle: ContainerLifecycle) -> str:
-    """Clone repo (shallow), inspect files, return purpose string."""
-```
-
-**Detection rules** (in priority order):
-1. `Cargo.toml` present → "rust"
-2. `pyproject.toml` or `setup.py` or `requirements.txt` → "python"
-3. `package.json` → "node"
-4. `go.mod` → "go"
-5. `Dockerfile` present → use that Dockerfile directly
-6. Fallback → "general"
-
-**Additional `create` parameter**:
-- `repo_url` — Git URL to clone (used with purpose="try-repo")
-
-**Flow**: Shallow clone into temp dir → detect → create container with detected purpose → full clone inside container → run setup.
-
-**Tests**:
-- `test_detect_python_repo` — pyproject.toml triggers python
-- `test_detect_node_repo` — package.json triggers node
-- `test_detect_rust_repo` — Cargo.toml triggers rust
-- `test_detect_dockerfile` — Dockerfile uses custom image
-- `test_detect_fallback` — unknown repo gets general
-
-**Done when**: `containers(create, purpose="try-repo", repo_url="https://github.com/user/repo")` auto-detects the right environment.
+**Done when**: `containers(create, purpose="amplifier")` produces a container where Amplifier just works.
 
 ---
 
-### Task 4.2: Background Execution with Polling
+### Task 3.2: Update Operator Agent and Context
 
-**What**: For long-running commands, run in background and poll for completion.
+**What**: Update container-operator.md and container-guide.md to cover Phase 2 features.
 
-**Add operations**:
-- `exec_background(container, command)` — returns `job_id`
-- `exec_poll(container, job_id)` — returns status, partial output
-- `exec_cancel(container, job_id)` — kill the background process
+**Update `context/container-guide.md`**:
+- Add provisioning report documentation (what each status means)
+- Add image caching documentation (cache_bust, cache_clear)
+- Add try-repo documentation with examples
+- Add background exec documentation (exec_background/poll/cancel)
+- Add UID mapping documentation (user parameter, when to use root)
+- Update troubleshooting section
 
-**Implementation**: Start command with nohup, redirect output to a temp file, return PID as job_id. Poll reads the temp file. Cancel sends SIGTERM.
+**Update `agents/container-operator.md`**:
+- Add try-repo pattern to operating principles
+- Add background exec pattern for long-running tasks
+- Add image cache management guidance
 
-**Tests**:
-- `test_background_exec_returns_job_id`
-- `test_poll_running_job` — returns partial output
-- `test_poll_completed_job` — returns full output and exit code
-- `test_cancel_job` — process killed
+**Update `context/container-awareness.md`**:
+- Add try-repo to purpose table
+- Add provisioning report mention (caller knows what happened)
+- Add background exec operations to quick reference
 
-**Done when**: Long-running commands don't block the tool. Agent can start a build and check on it later.
+**Tests**: N/A (documentation)
+
+**Done when**: All context docs reflect the current feature set.
 
 ---
 
-### Task 4.3: GPU Passthrough
+## Phase 4: Extended Capabilities
+
+> Goal: GPU support, Docker Compose (with informed decision), and further polish.
+
+### Task 4.1: GPU Passthrough
 
 **What**: Support `--gpus all` for ML/AI workloads.
 
-**Modify create**:
-- If `gpu=True`, add `--gpus all` to docker run
-- Preflight: check `nvidia-smi` or `docker info --format '{{.Runtimes}}'` for nvidia runtime
+**Changes**:
+- If `gpu=True` on create, add `--gpus all` to docker run args
+- Add GPU check to preflight: detect nvidia runtime via `docker info`
+- Safety hook already handles approval gate for GPU access
 
 **Tests**:
 - `test_gpu_flag_added` — --gpus all in docker run args
@@ -1201,31 +1268,37 @@ async def detect_repo_purpose(self, repo_url: str, lifecycle: ContainerLifecycle
 
 ---
 
-### Task 4.4: Curated Base Image
+### Task 4.2: Docker Compose Evaluation and Implementation
 
-**What**: Optional pre-built image with common tools for faster startup.
+**What**: Evaluate whether to add Docker Compose pass-through, then implement if warranted.
 
-**File**: `images/amplifier-base/Dockerfile`
+**Before implementation**, prepare a pro/con brief for the user:
 
-**Contents**:
-- Base: python:3.12-slim
-- Common tools: git, curl, wget, jq, tree, vim-tiny, less, make, build-essential
-- uv pre-installed
-- Non-root user `amplifier`
-- Proper locale setup
+**What Compose gives you**:
+- Declarative multi-service definition in a single YAML file
+- Automatic network creation between services
+- Volume management and data persistence
+- Health checks and dependency ordering (service A waits for service B)
+- One-command teardown of entire stacks
+- Widely adopted format — many projects ship a docker-compose.yml
 
-**Not included in the Dockerfile**: Application-specific tools (those come from purpose profiles at runtime).
+**What you lose / trade off**:
+- Another YAML format to understand (vs our `create` + `create_network` approach)
+- Compose files may conflict with our container tracking (labels, metadata)
+- Users need `docker compose` plugin installed (additional prerequisite)
+- Less granular control than individual `create` calls
+- Our provisioning pipeline (env forwarding, dotfiles, etc.) doesn't apply to compose services
 
-**Distribution**: Push to GitHub Container Registry (ghcr.io/microsoft/amplifier-base).
+**Recommendation**: Compose is most useful when users already have a docker-compose.yml they want to use. Our create+network approach is better for agent-driven orchestration. Both can coexist.
 
-**Integration**: Purpose profiles can reference this image instead of stock images for faster startup.
+**If approved**, implement:
+- `compose_up(compose_file, project_name)` — `docker compose -f file up -d`
+- `compose_down(project_name)` — `docker compose down`
+- `compose_status(project_name)` — `docker compose ps --format json`
 
-**Tests**:
-- `test_dockerfile_builds` — image builds successfully
-- `test_image_has_tools` — all expected tools present
-- `test_image_nonroot_user` — runs as non-root by default
+**Tests**: Standard lifecycle tests with a simple compose file (nginx + redis).
 
-**Done when**: Optional curated image available for faster container startup.
+**Done when**: User has made an informed decision. If approved, compose operations work.
 
 ---
 
@@ -1237,38 +1310,24 @@ async def detect_repo_purpose(self, repo_url: str, lifecycle: ContainerLifecycle
 |----------|----------|----------------|-----|
 | Unit tests | `tests/unit/` | No | Yes |
 | Integration tests | `tests/integration/` | Yes | Needs Docker-in-Docker |
-| End-to-end tests | `tests/e2e/` | Yes | Manual/nightly |
 
-### Unit Test Approach
-- Mock `ContainerRuntime.run()` to avoid real Docker calls
-- Test parameter building, config merging, metadata management
-- Test pattern matching, purpose resolution, provisioning logic
+### Running Tests
 
-### Integration Test Approach
-- Require real Docker/Podman (skip if not available)
-- Use small images (alpine:3.19) for speed
-- Clean up all containers in test teardown
-- Timeout per test: 60s
+```bash
+# All tests
+pytest tests/ -v
 
-### Fixtures
+# Unit tests only (fast, no Docker needed)
+pytest tests/unit/ -v
 
-```python
-@pytest.fixture
-async def runtime():
-    """Real container runtime (skip if unavailable)."""
-    rt = ContainerRuntime()
-    if not await rt.detect():
-        pytest.skip("No container runtime available")
-    return rt
+# Integration tests only (needs Docker)
+pytest tests/integration/ -v
 
-@pytest.fixture
-async def container(runtime):
-    """Create and cleanup a test container."""
-    lifecycle = ContainerLifecycle(runtime, {})
-    result = await lifecycle.create(CreateParams(
-        name=f"test-{uuid4().hex[:8]}",
-        image="alpine:3.19",
-    ))
-    yield result
-    await lifecycle.destroy(result.name, force=True)
+# Skip integration tests
+pytest tests/ -v -m "not integration"
 ```
+
+### Current Test Count
+- Phase 1: 43 unit + 11 integration = 54 tests
+- Phase 2 target: ~20 additional unit + ~7 integration
+- Total target: ~80 tests

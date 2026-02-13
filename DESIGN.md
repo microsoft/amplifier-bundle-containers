@@ -1,6 +1,6 @@
 # amplifier-bundle-containers - Design Document
 
-> **Status**: Approved Design
+> **Status**: Revised after Phase 1 implementation
 > **Date**: 2025-02-12
 
 ---
@@ -122,6 +122,12 @@ includes:
 
 ---
 
+### 4.4 Host UID/GID Mapping (Default)
+
+Containers default to matching the host user's UID/GID for mounted volumes. This prevents the common friction of files created inside the container being owned by root on the host.
+
+Implementation: `--user $(id -u):$(id -g)` is added to `docker run` by default. Provisioning paths adapt to use the mapped user's home directory instead of hardcoded `/root/`. A `user` parameter on `create` allows override when needed (e.g., `user="root"` for system-level work).
+
 ## 5. Tool Operations API
 
 ### Core Lifecycle
@@ -206,6 +212,28 @@ Container created and started
 
 Order matters: GH auth before dotfiles (for private repos). Dotfiles before setup_commands (user can override).
 
+### 7.1 Provisioning Report
+
+Every `create` call returns a structured `provisioning_report` alongside the container info. This eliminates the need for the caller to investigate what happened:
+
+```json
+{
+    "success": true,
+    "container": "amp-python-a3f2",
+    "provisioning_report": {
+        "env_passthrough": {"status": "success", "vars_injected": 5},
+        "forward_git": {"status": "success", "detail": "Copied .gitconfig, .gitconfig.local"},
+        "forward_gh": {"status": "success", "detail": "GH token injected, gh auth login completed"},
+        "forward_ssh": {"status": "skipped", "detail": "Not requested"},
+        "dotfiles": {"status": "success", "detail": "Cloned user/dotfiles, ran install.sh"},
+        "purpose_setup": {"status": "success", "detail": "Installed uv, created venv"},
+        "setup_commands": {"status": "partial", "detail": "2/3 commands succeeded", "failures": ["apt install foo: package not found"]}
+    }
+}
+```
+
+Each provisioning step reports: `success`, `skipped`, `failed`, or `partial`. The caller gets full visibility without needing to exec into the container to check.
+
 ---
 
 ## 8. Three-Layer Provisioning Model
@@ -226,6 +254,17 @@ Each layer builds on the one below. Dotfiles are additive to individual forwardi
 5. `script/setup`
 6. `Makefile` (run `make`)
 7. Smart symlink of common dotfiles (fallback)
+
+### 8.1 Local Image Caching
+
+Purpose profiles build on stock Docker images but install packages at creation time (slow). To accelerate repeated use:
+
+1. After first successful creation with a purpose profile, `docker commit` the provisioned state as `amplifier-cache:{purpose}` (e.g., `amplifier-cache:python`)
+2. On subsequent creates with the same purpose, check if cached image exists and use it
+3. Cache is local-only — no registry publishing required
+4. Cache can be invalidated manually or via a `cache_bust=true` parameter
+
+This avoids the 30-60 second `apt-get install` on every container creation while staying fully local.
 
 ---
 
@@ -289,3 +328,19 @@ Non-persistent containers cleaned up on `session:end` via hook.
 ## 13. Relationship to Shadow Bundle
 
 Independent. Shadow's value is Gitea + git URL rewriting + source snapshotting. This bundle is general-purpose. Future: extract shared container-runtime utility.
+
+---
+
+## 14. Implementation Phases
+
+### Phase 1: Core MVP — COMPLETE
+Runtime detection, preflight, create/exec/destroy, env passthrough, git/GH/SSH forwarding, dotfiles, purpose profiles, CWD mount, tracking, context docs, snapshots, networks. 54 tests (43 unit + 11 integration).
+
+### Phase 2: Production Readiness
+UID/GID mapping, provisioning report, local image caching, try-repo auto-detection, background exec with polling, dev infrastructure (root pyproject.toml, pytest config).
+
+### Phase 3: Amplifier-in-Container
+Amplifier purpose profile polish (settings forwarding, bundle config), multi-container orchestration patterns.
+
+### Phase 4: Extended Capabilities
+GPU passthrough, Docker Compose pass-through (with pro/con evaluation), curated image publishing (when ready).
