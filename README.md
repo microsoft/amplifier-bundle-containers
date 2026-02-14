@@ -37,6 +37,7 @@ includes:
 - "Spin up three containers, each running a different task"
 - "Set up Postgres + Redis + my app in containers"
 - "Give me a clean Rust environment to experiment in"
+- "Try out https://github.com/org/cool-project for me"
 
 **The assistant will:**
 
@@ -57,7 +58,7 @@ includes:
 | `rust` | Rust toolchain + build tools |
 | `go` | Go 1.22 toolchain |
 | `general` | Ubuntu 24.04 + common dev tools |
-| `amplifier` | Amplifier pre-installed + all credentials forwarded |
+| `amplifier` | Amplifier pre-installed + all credentials + settings forwarded |
 | `try-repo` | Auto-detect language from repo, clone and set up |
 | `clean` | Pristine — no dotfiles, no forwarding |
 
@@ -82,7 +83,54 @@ containers(operation="create",
 
 Supports install scripts (`install.sh`, `setup.sh`, `bootstrap.sh`, `Makefile`) or auto-symlinks common dotfiles as fallback.
 
-### Container Lifecycle
+### Two-Phase User Model
+
+Containers run as root during setup (package installation, user creation) then switch to a mapped user matching your host UID:GID for all `exec` commands. This ensures files created on mounted volumes have correct ownership. Use `as_root=True` on `exec` for admin operations at any time.
+
+### Try-Repo Auto-Detection
+
+Point the tool at any git repo and it auto-detects the language, selects the right base image, clones the repo, and runs setup:
+
+```
+containers(operation="create", purpose="try-repo",
+    repo_url="https://github.com/org/cool-project")
+```
+
+### Provisioning Report
+
+Every `create` returns a structured report showing the status of each provisioning step (env vars, git config, GH auth, dotfiles, setup commands). No need to investigate — the report tells you exactly what succeeded, failed, or was skipped.
+
+### Image Caching
+
+Purpose-based images are cached locally after first creation. Second and subsequent creates with the same purpose skip package installation entirely. Use `cache_bust=True` for a fresh build or `cache_clear` to remove cached images.
+
+### Background Execution
+
+Run long-running tasks without blocking:
+
+```
+containers(operation="exec_background", container="my-env",
+    command="pytest -v --slow")
+# Returns immediately with job_id
+
+containers(operation="exec_poll", container="my-env", job_id="a3f2e1c8")
+# Check progress, get last 100 lines of output
+```
+
+### Amplifier-in-Container
+
+Run parallel Amplifier agents, each in its own isolated container with full credentials and settings forwarded:
+
+```
+containers(operation="create", name="agent-a", purpose="amplifier",
+    amplifier_bundle="git+https://github.com/org/bundle@main")
+containers(operation="exec_background", container="agent-a",
+    command="amplifier run 'refactor the auth module'")
+```
+
+### Operations
+
+**Core Lifecycle**
 
 | Operation | Description |
 |-----------|-------------|
@@ -91,9 +139,39 @@ Supports install scripts (`install.sh`, `setup.sh`, `bootstrap.sh`, `Makefile`) 
 | `exec` | Run commands inside a container |
 | `exec_interactive_hint` | Get the connect command for the user |
 | `list` / `status` | See what's running |
-| `snapshot` / `restore` | Save and restore container state |
-| `copy_in` / `copy_out` | Transfer files |
 | `destroy` / `destroy_all` | Clean up |
+
+**File Transfer**
+
+| Operation | Description |
+|-----------|-------------|
+| `copy_in` / `copy_out` | Transfer files between host and container |
+
+**State Management**
+
+| Operation | Description |
+|-----------|-------------|
+| `snapshot` / `restore` | Save and restore container state |
+
+**Networks**
+
+| Operation | Description |
+|-----------|-------------|
+| `create_network` / `destroy_network` | Docker networks for service stacks |
+
+**Cache**
+
+| Operation | Description |
+|-----------|-------------|
+| `cache_clear` | Remove cached purpose images |
+
+**Background Execution**
+
+| Operation | Description |
+|-----------|-------------|
+| `exec_background` | Start a long-running command, get a job_id |
+| `exec_poll` | Check status and output of a background job |
+| `exec_cancel` | Kill a background job |
 
 ### Multi-Container Support
 
@@ -145,10 +223,10 @@ modules:
 
 Every container is created with hardened defaults:
 
-- `--cap-drop=ALL` — all Linux capabilities dropped
-- `--security-opt=no-new-privileges` — no privilege escalation
+- `--security-opt=no-new-privileges` — no privilege escalation via setuid
 - `--memory=4g` — prevent host OOM
 - `--pids-limit=256` — prevent fork bombs
+- Docker's default capability set (allows package installation and user creation inside the container)
 - Bridge networking (not host)
 - Never privileged by default
 

@@ -21,7 +21,7 @@ You have access to the `containers` tool for creating and managing isolated cont
 5. containers(operation="destroy", container="...")  # Clean up when done
 ```
 
-## Key Operations
+## Operations
 
 | Operation | Use For |
 |-----------|---------|
@@ -35,6 +35,11 @@ You have access to the `containers` tool for creating and managing isolated cont
 | `destroy_all` | Remove all managed containers |
 | `copy_in` / `copy_out` | Transfer files between host and container |
 | `snapshot` / `restore` | Save and restore container state |
+| `create_network` / `destroy_network` | Docker networks for multi-container communication |
+| `cache_clear` | Remove cached purpose images (one or all) |
+| `exec_background` | Start a long-running command, returns a job_id |
+| `exec_poll` | Check status and get output of a background job |
+| `exec_cancel` | Kill a background job |
 
 ## The `purpose` Parameter
 
@@ -47,8 +52,8 @@ Use `purpose` on `create` to get smart defaults instead of specifying everything
 | `"rust"` | Rust toolchain + build tools |
 | `"go"` | Go 1.22 toolchain |
 | `"general"` | Ubuntu 24.04 + common dev tools |
-| `"amplifier"` | Python + Amplifier pre-installed + all credentials forwarded |
-| `"try-repo"` | Auto-detect language from repo, clone and set up |
+| `"amplifier"` | Python + Amplifier pre-installed + all credentials + settings forwarded |
+| `"try-repo"` | Auto-detect language from repo, clone and set up (requires `repo_url`) |
 | `"clean"` | Pristine environment — no dotfiles, no credential forwarding |
 
 ## Convenience Features (on `create`)
@@ -61,8 +66,13 @@ These make the container feel like home with zero effort:
 | `forward_git` | `true` | Copies .gitconfig so git works naturally |
 | `forward_gh` | `true` | Forwards GH CLI auth for private repos |
 | `forward_ssh` | `false` | Mounts ~/.ssh read-only (opt-in) |
-| `dotfiles_repo` | config | Clones and runs a dotfiles install script |
+| `dotfiles_repo` / `dotfiles_inline` | config | Clones a dotfiles repo or writes inline files |
 | `mount_cwd` | `true` | Mounts current directory into /workspace |
+| `as_root` | `false` | Run exec as root for admin operations (package install, system changes) |
+| `repo_url` | none | Git URL to clone (used with `purpose="try-repo"`) |
+| `cache_bust` | `false` | Force fresh build, ignoring cached purpose image |
+| `amplifier_version` | latest | Pin Amplifier version (`purpose="amplifier"` only) |
+| `amplifier_bundle` | none | Bundle URI to configure inside container (`purpose="amplifier"` only) |
 
 ## Patterns
 
@@ -84,8 +94,23 @@ Set up for user, user works, agent assists further:
 create -> exec (setup) -> hand off -> user works -> user asks for help -> exec
 ```
 
+### Parallel Agents (Background Execution)
+Create multiple containers, run tasks concurrently:
+```
+create(purpose="amplifier", name="agent-a", ...)
+create(purpose="amplifier", name="agent-b", ...)
+exec_background(container="agent-a", command="amplifier run 'task 1'")
+exec_background(container="agent-b", command="amplifier run 'task 2'")
+exec_poll(container="agent-a", job_id="...")
+exec_poll(container="agent-b", job_id="...")
+```
+
 ## Important
 
+- The provisioning report is returned from `create` — no need to investigate what was set up
+- Use `as_root=True` on `exec` for admin operations (package installation, system changes)
+- Container runs as root for setup; `exec` runs as the mapped host user for correct file ownership
+- Image caching makes the second `create` with the same purpose much faster
 - Always provide `exec_interactive_hint` output when handing a container to the user
 - Use `purpose` to let the tool choose smart defaults — don't over-specify
 - Containers are ephemeral by default — destroyed on session end

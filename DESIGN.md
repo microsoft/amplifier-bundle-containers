@@ -344,8 +344,8 @@ Runtime detection, preflight, create/exec/destroy, env passthrough, git/GH/SSH f
 ### Phase 2: Production Readiness — COMPLETE
 UID/GID mapping, provisioning report, local image caching, try-repo auto-detection, background exec with polling, dev infrastructure. 103 tests (87 unit + 16 integration).
 
-### Phase 3: Two-Phase User Model + Amplifier-in-Container
-Refactor to two-phase user model (root setup, mapped user exec), amplifier purpose profile polish (settings forwarding, parallel-agents pattern), documentation refresh.
+### Phase 3: Two-Phase User Model + Amplifier-in-Container — COMPLETE
+Two-phase user model (root setup, mapped user exec, as_root override), amplifier purpose profile polish (settings forwarding, version/bundle params, parallel-agents pattern), documentation refresh. 123 tests (107 unit + 16 integration).
 
 ### Phase 4: Extended Capabilities
 GPU passthrough, Docker Compose pass-through (with pro/con evaluation), curated image publishing (when ready).
