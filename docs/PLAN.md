@@ -775,7 +775,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "modules" / "tool-containe
 **What**: Default to host user's UID/GID when mounting volumes, so files created in the container have correct ownership on the host.
 
 **Files to modify**:
-- `modules/tool-containers/amplifier_module_tool_containers/__init__.py` — `_op_create` method
+- `modules/tool-containers/amplifier_module_tool_containers/__init__.py` — `_op_create` method, `_get_container_home()` helper
+- `modules/tool-containers/amplifier_module_tool_containers/provisioner.py` — Extract provisioning methods from `__init__.py` (per Phase 2 extraction note): `_provision_git`, `_provision_gh_auth`, `_fix_ssh_permissions`, `_provision_dotfiles`, `_provision_dotfiles_inline`. Update all `/root/` paths to use dynamic home directory.
 
 **Changes**:
 
@@ -942,14 +943,25 @@ await self.runtime.run("commit", container_name, cache_tag, timeout=120)
 2. On subsequent creates with the same purpose, check for the cached image first:
 ```python
 async def _get_cached_image(self, purpose: str) -> str | None:
-    """Check if a locally cached image exists for this purpose."""
+    """Check if a locally cached image exists and is current for this purpose."""
     cache_tag = f"amplifier-cache:{purpose}"
     result = await self.runtime.run(
-        "image", "inspect", cache_tag, timeout=10
+        "image", "inspect", "--format",
+        "{{index .Config.Labels \"amplifier.cache.version\"}}",
+        cache_tag, timeout=10,
     )
-    if result.returncode == 0:
-        return cache_tag
-    return None
+    if result.returncode != 0:
+        return None  # No cached image
+    
+    # Verify cache version matches current profile definition
+    profile = PURPOSE_PROFILES.get(purpose)
+    if profile:
+        expected_hash = hashlib.md5(str(profile).encode()).hexdigest()[:8]
+        cached_hash = result.stdout.strip()
+        if cached_hash != expected_hash:
+            return None  # Cache is stale, profile definition changed
+    
+    return cache_tag
 ```
 
 3. When a cached image is found, skip the package install setup_commands from the purpose profile (they're already baked in). Still run: env provisioning, credential forwarding, dotfiles, user's explicit setup_commands.
@@ -973,8 +985,15 @@ async def _op_cache_clear(self, inp: dict) -> dict:
 
 **Cache invalidation**: Cached images should include a version label so we can detect when the purpose profile definition has changed:
 ```python
-# When committing cache:
-labels = {"amplifier.cache.version": hashlib.md5(str(profile).encode()).hexdigest()[:8]}
+# When committing cache, include version label for invalidation:
+version_hash = hashlib.md5(str(profile).encode()).hexdigest()[:8]
+cache_tag = f"amplifier-cache:{purpose}"
+await self.runtime.run(
+    "commit",
+    "--change", f'LABEL amplifier.cache.version={version_hash}',
+    container_name, cache_tag,
+    timeout=120,
+)
 ```
 
 **Tests**:
@@ -1010,10 +1029,13 @@ REPO_MARKERS = [
     ("go.mod", "go"),
 ]
 
-async def detect_repo_purpose(runtime, repo_url: str) -> tuple[str, list[str]]:
+async def detect_repo_purpose(repo_url: str) -> tuple[str, list[str]]:
     """Shallow clone repo on HOST, inspect files, return (purpose, setup_hints).
     
-    Returns purpose string and optional setup commands specific to the repo.
+    Uses git directly on the host (not container runtime) since this runs
+    BEFORE the container is created to determine which purpose profile to use.
+    Clone is done via asyncio.create_subprocess_exec("git", ...) into a
+    temp directory that is cleaned up after inspection.
     """
 ```
 
@@ -1039,7 +1061,7 @@ if purpose == "try-repo":
     repo_url = inp.get("repo_url")
     if not repo_url:
         return {"error": "repo_url is required when purpose is 'try-repo'"}
-    detected_purpose, setup_hints = await detect_repo_purpose(self.runtime, repo_url)
+    detected_purpose, setup_hints = await detect_repo_purpose(repo_url)
     inp["purpose"] = detected_purpose
     # Add clone + setup to setup_commands
     inp.setdefault("setup_commands", [])
@@ -1083,11 +1105,11 @@ async def _op_exec_background(self, inp: dict) -> dict:
     command = inp["command"]
     job_id = uuid.uuid4().hex[:8]
     
-    # Run command with nohup, redirect output to a temp file, capture PID
+    # Run command in background, save PID and exit code to temp files
     bg_cmd = (
-        f"nohup /bin/sh -c '{command}' "
+        f"(/bin/sh -c '{command}'; echo $? > /tmp/amp-job-{job_id}.exit) "
         f"> /tmp/amp-job-{job_id}.out 2>&1 & "
-        f"echo $!"
+        f"echo $! > /tmp/amp-job-{job_id}.pid && cat /tmp/amp-job-{job_id}.pid"
     )
     result = await self.runtime.run("exec", container, "/bin/sh", "-c", bg_cmd, timeout=10)
     pid = result.stdout.strip()
@@ -1140,15 +1162,6 @@ async def _op_exec_cancel(self, inp: dict) -> dict:
         timeout=5,
     )
     return {"job_id": job_id, "cancelled": True}
-```
-
-**Update the background command to save PID and exit code**:
-```python
-bg_cmd = (
-    f"(/bin/sh -c '{command}'; echo $? > /tmp/amp-job-{job_id}.exit) "
-    f"> /tmp/amp-job-{job_id}.out 2>&1 & "
-    f"echo $! > /tmp/amp-job-{job_id}.pid && cat /tmp/amp-job-{job_id}.pid"
-)
 ```
 
 **Add to tool_definitions operation enum**: `"exec_background"`, `"exec_poll"`, `"exec_cancel"`
