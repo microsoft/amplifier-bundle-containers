@@ -146,6 +146,7 @@ class ContainersTool:
                                 "restore",
                                 "create_network",
                                 "destroy_network",
+                                "cache_clear",
                             ],
                             "description": "Container operation to perform",
                         },
@@ -219,6 +220,11 @@ class ContainersTool:
                             "type": "string",
                             "description": "Snapshot name (for snapshot/restore)",
                         },
+                        "cache_bust": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Ignore cached image, build fresh",
+                        },
                     },
                     "required": ["operation"],
                 },
@@ -242,6 +248,47 @@ class ContainersTool:
             self._preflight_passed = True
 
         return await handler(tool_input)
+
+    # -- Caching -------------------------------------------------------------
+
+    async def _get_cached_image(self, purpose: str) -> str | None:
+        """Check if a locally cached image exists and is current for this purpose."""
+        from .images import get_profile_hash
+
+        cache_tag = f"amplifier-cache:{purpose}"
+        result = await self.runtime.run(
+            "image",
+            "inspect",
+            "--format",
+            '{{index .Config.Labels "amplifier.cache.version"}}',
+            cache_tag,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None  # No cached image
+
+        # Verify cache version matches current profile definition
+        expected_hash = get_profile_hash(purpose)
+        if expected_hash:
+            cached_hash = result.stdout.strip()
+            if cached_hash != expected_hash:
+                return None  # Cache is stale
+
+        return cache_tag
+
+    async def _cache_image(self, container: str, purpose: str) -> None:
+        """Commit container state as a cached image for this purpose."""
+        from .images import get_profile_hash
+
+        version_hash = get_profile_hash(purpose)
+        cache_tag = f"amplifier-cache:{purpose}"
+
+        args = ["commit"]
+        if version_hash:
+            args.extend(["--change", f"LABEL amplifier.cache.version={version_hash}"])
+        args.extend([container, cache_tag])
+
+        await self.runtime.run(*args, timeout=120)
 
     # -- Operations ----------------------------------------------------------
 
@@ -360,6 +407,19 @@ class ContainersTool:
         purpose = inp.get("purpose")
         if purpose:
             inp = resolve_purpose(purpose, inp)
+
+        # Check for cached image (skip if cache_bust=True or no purpose)
+        cache_used = False
+        if purpose and not inp.get("cache_bust", False):
+            cached_image = await self._get_cached_image(purpose)
+            if cached_image:
+                inp["image"] = cached_image
+                cache_used = True
+                # Remove profile setup commands, keep only user's explicit ones
+                profile_cmds = inp.get("_profile_setup_commands", [])
+                all_cmds = inp.get("setup_commands", [])
+                user_cmds = all_cmds[len(profile_cmds) :]
+                inp["setup_commands"] = user_cmds
 
         # Build create params
         import uuid
@@ -565,6 +625,10 @@ class ContainersTool:
             },
         )
 
+        # Cache the image for next time (only for purpose-based creates without cache)
+        if purpose and not cache_used and not inp.get("cache_bust", False):
+            await self._cache_image(name, purpose)
+
         # Get interactive hint
         runtime_name = await self.runtime.detect()
         hint = f"{runtime_name} exec -it {name} /bin/bash"
@@ -579,6 +643,7 @@ class ContainersTool:
             "workdir": workdir,
             "env_vars_injected": len(env_vars),
             "persistent": inp.get("persistent", False),
+            "cache_used": cache_used,
             "provisioning_report": [
                 {"name": s.name, "status": s.status, "detail": s.detail, "error": s.error}
                 for s in report
@@ -777,6 +842,42 @@ class ContainersTool:
             "success": result.returncode == 0,
             "network": name,
             "detail": result.stderr.strip() if result.returncode != 0 else "Network removed",
+        }
+
+    async def _op_cache_clear(self, inp: dict[str, Any]) -> dict[str, Any]:
+        """Remove locally cached purpose images."""
+        purpose = inp.get("purpose")
+        if purpose:
+            cache_tag = f"amplifier-cache:{purpose}"
+            result = await self.runtime.run("rmi", cache_tag, timeout=15)
+            return {
+                "success": result.returncode == 0,
+                "cleared": [purpose] if result.returncode == 0 else [],
+                "detail": result.stderr.strip()
+                if result.returncode != 0
+                else f"Cleared cache for {purpose}",
+            }
+        # Clear all amplifier-cache:* images
+        list_result = await self.runtime.run(
+            "images",
+            "--format",
+            "{{.Repository}}:{{.Tag}}",
+            "--filter",
+            "reference=amplifier-cache:*",
+            timeout=10,
+        )
+        cleared: list[str] = []
+        if list_result.returncode == 0 and list_result.stdout.strip():
+            for image_tag in list_result.stdout.strip().split("\n"):
+                rm_result = await self.runtime.run("rmi", image_tag.strip(), timeout=15)
+                if rm_result.returncode == 0:
+                    cleared.append(image_tag.strip())
+        return {
+            "success": True,
+            "cleared": cleared,
+            "detail": f"Cleared {len(cleared)} cached images"
+            if cleared
+            else "No cached images found",
         }
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -87,6 +88,14 @@ PURPOSE_PROFILES: dict[str, PurposeProfile] = {
 }
 
 
+def get_profile_hash(purpose: str) -> str | None:
+    """Get a hash of the purpose profile definition for cache invalidation."""
+    profile = PURPOSE_PROFILES.get(purpose)
+    if profile is None:
+        return None
+    return hashlib.md5(str(profile).encode()).hexdigest()[:8]
+
+
 def resolve_purpose(purpose: str, explicit: dict[str, Any]) -> dict[str, Any]:
     """Merge purpose profile defaults with explicit parameters.
 
@@ -114,6 +123,8 @@ def resolve_purpose(purpose: str, explicit: dict[str, Any]) -> dict[str, Any]:
 
     merged = {**defaults, **{k: v for k, v in explicit.items() if v is not None}}
     existing_setup = merged.get("setup_commands", [])
+    # Track which setup commands came from the profile (for cache differentiation)
+    merged["_profile_setup_commands"] = purpose_setup
     merged["setup_commands"] = purpose_setup + list(existing_setup)
     if profile.env:
         merged_env = {**profile.env, **merged.get("env", {})}

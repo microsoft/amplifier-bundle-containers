@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from amplifier_module_tool_containers.images import resolve_purpose
+from amplifier_module_tool_containers.images import get_profile_hash, resolve_purpose
 
 
 def test_resolve_python():
@@ -65,9 +65,7 @@ def test_setup_commands_prepended():
 
 def test_purpose_env_merged():
     """Purpose env merged with explicit env (explicit wins)."""
-    result = resolve_purpose(
-        "python", {"env": {"VIRTUAL_ENV": "/custom", "MY_VAR": "1"}}
-    )
+    result = resolve_purpose("python", {"env": {"VIRTUAL_ENV": "/custom", "MY_VAR": "1"}})
     env = result["env"]
     # Explicit wins for VIRTUAL_ENV
     assert env["VIRTUAL_ENV"] == "/custom"
@@ -75,3 +73,47 @@ def test_purpose_env_merged():
     assert env["MY_VAR"] == "1"
     # Purpose's PATH env is still present
     assert "PATH" in env
+
+
+# ---------------------------------------------------------------------------
+# Profile hash tests
+# ---------------------------------------------------------------------------
+
+
+def test_get_profile_hash_known_purpose():
+    """get_profile_hash returns a string for known purposes."""
+    h = get_profile_hash("python")
+    assert isinstance(h, str)
+    assert len(h) == 8
+
+
+def test_get_profile_hash_unknown_purpose():
+    """get_profile_hash returns None for unknown purposes."""
+    assert get_profile_hash("nonexistent-purpose") is None
+
+
+def test_get_profile_hash_deterministic():
+    """Same purpose always produces the same hash."""
+    h1 = get_profile_hash("python")
+    h2 = get_profile_hash("python")
+    assert h1 == h2
+
+
+# ---------------------------------------------------------------------------
+# Profile command tracking tests
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_purpose_tracks_profile_commands():
+    """resolve_purpose includes _profile_setup_commands for cache differentiation."""
+    result = resolve_purpose("python", {"setup_commands": ["echo user-cmd"]})
+    assert "_profile_setup_commands" in result
+    profile_cmds = result["_profile_setup_commands"]
+    assert isinstance(profile_cmds, list)
+    assert len(profile_cmds) > 0
+    # Profile commands should include apt-get and uv setup
+    assert any("apt-get" in c for c in profile_cmds)
+    # User command should NOT be in profile commands
+    assert "echo user-cmd" not in profile_cmds
+    # But user command should be in the full setup_commands list
+    assert result["setup_commands"][-1] == "echo user-cmd"

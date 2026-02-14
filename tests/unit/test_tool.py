@@ -262,3 +262,134 @@ async def test_provisioning_report_setup_command_partial(tool: ContainersTool):
     assert setup_step["status"] == "partial"
     assert "1/2" in setup_step["detail"]
     assert setup_step["error"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Cache clear
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cache_clear_requires_no_params(tool: ContainersTool):
+    """cache_clear works without purpose (clears all)."""
+    # Mock: no cached images found
+    tool.runtime.run = AsyncMock(return_value=CommandResult(0, "", ""))
+    result = await tool.execute("containers", {"operation": "cache_clear"})
+    assert result["success"] is True
+    assert isinstance(result["cleared"], list)
+    assert "detail" in result
+
+
+@pytest.mark.asyncio
+async def test_cache_clear_specific_purpose(tool: ContainersTool):
+    """cache_clear with purpose targets a specific image."""
+    tool.runtime.run = AsyncMock(return_value=CommandResult(0, "", ""))
+    result = await tool.execute("containers", {"operation": "cache_clear", "purpose": "python"})
+    assert result["success"] is True
+    assert result["cleared"] == ["python"]
+
+
+# ---------------------------------------------------------------------------
+# Cache used in create result
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_result_includes_cache_used(tool: ContainersTool):
+    """create result includes cache_used field."""
+    tool._preflight_passed = True
+
+    async def _mock_run(*args: str, **kwargs: object) -> CommandResult:
+        if args and args[0] == "run":
+            return CommandResult(0, "abc123def456\n", "")
+        # Return failure for image inspect (no cache)
+        if args and args[0] == "image":
+            return CommandResult(1, "", "No such image")
+        # commit call succeeds
+        if args and args[0] == "commit":
+            return CommandResult(0, "sha256:abc\n", "")
+        return CommandResult(0, "/root\n", "")
+
+    tool.runtime.run = _mock_run  # type: ignore[assignment]
+    tool.provisioner.runtime.run = _mock_run  # type: ignore[assignment]
+
+    with (
+        patch("amplifier_module_tool_containers.provisioner.shutil.which", return_value=None),
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        mock_home = mock_path.home.return_value
+        no_file = type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: "/fake/.gitconfig"}
+        )()
+        mock_home.__truediv__ = lambda self, key: no_file
+
+        result = await tool.execute(
+            "containers",
+            {
+                "operation": "create",
+                "name": "test-cache-field",
+                "purpose": "python",
+                "forward_git": False,
+                "forward_gh": False,
+                "forward_ssh": False,
+                "dotfiles_skip": True,
+            },
+        )
+
+    assert "cache_used" in result
+    assert result["cache_used"] is False  # No cache existed
+
+
+@pytest.mark.asyncio
+async def test_create_uses_cached_image(tool: ContainersTool):
+    """create with a cached image sets cache_used=True and skips profile setup."""
+    tool._preflight_passed = True
+    executed_commands: list[str] = []
+
+    async def _mock_run(*args: str, **kwargs: object) -> CommandResult:
+        # Track exec commands to verify profile setup is skipped
+        if args and args[0] == "exec" and len(args) > 4:
+            executed_commands.append(args[4])
+        if args and args[0] == "run":
+            return CommandResult(0, "abc123def456\n", "")
+        # Cache hit: image inspect returns matching hash
+        if args and args[0] == "image":
+            from amplifier_module_tool_containers.images import get_profile_hash
+
+            expected = get_profile_hash("python")
+            return CommandResult(0, f"{expected}\n", "")
+        return CommandResult(0, "/root\n", "")
+
+    tool.runtime.run = _mock_run  # type: ignore[assignment]
+    tool.provisioner.runtime.run = _mock_run  # type: ignore[assignment]
+
+    with (
+        patch("amplifier_module_tool_containers.provisioner.shutil.which", return_value=None),
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        mock_home = mock_path.home.return_value
+        no_file = type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: "/fake/.gitconfig"}
+        )()
+        mock_home.__truediv__ = lambda self, key: no_file
+
+        result = await tool.execute(
+            "containers",
+            {
+                "operation": "create",
+                "name": "test-cache-hit",
+                "purpose": "python",
+                "forward_git": False,
+                "forward_gh": False,
+                "forward_ssh": False,
+                "dotfiles_skip": True,
+                "setup_commands": ["echo user-cmd"],
+            },
+        )
+
+    assert result["cache_used"] is True
+    assert result["image"] == "amplifier-cache:python"
+    # Profile setup commands (apt-get, uv) should NOT have been executed
+    assert not any("apt-get" in c for c in executed_commands)
+    # User's explicit command should still have been executed
+    assert "echo user-cmd" in executed_commands
