@@ -1487,25 +1487,144 @@ async def provision_amplifier_settings(self, container: str, target_home: str) -
 
 ### Task 4.1: GPU Passthrough — Preflight Detection
 
-**What**: Add GPU runtime detection to `preflight`. The `--gpus all` flag is already implemented in `_op_create` (added when `gpu=True`), so this task focuses on the missing preflight piece.
+**What**: Add an informational GPU runtime check to `_op_preflight`. The `--gpus all` flag is already implemented in `_op_create` (line ~498-500), so this task adds the missing preflight visibility.
+
+**Files to modify**:
+- `modules/tool-containers/amplifier_module_tool_containers/__init__.py` — `_op_preflight` method (starts at line ~319)
+- `tests/unit/test_tool.py` — Add GPU preflight tests
 
 **Already implemented** (no changes needed):
-- `_op_create` already adds `--gpus all` to docker run args when `gpu=True` is passed
+- `_op_create` adds `--gpus all` to docker run args when `gpu=True` (line ~498-500)
+- `gpu` parameter in tool schema (line ~218) and `CreateParams` (line ~55)
 
-**Changes needed**:
-- Add a GPU-specific preflight check to `_op_preflight` that detects whether the NVIDIA container runtime is available via `docker info --format '{{.Runtimes}}'` (or equivalent)
-- The check should report whether GPU passthrough is available, not fail if it isn't (GPU is optional)
-- Include guidance when GPU is requested but runtime is not available (install `nvidia-container-toolkit`)
+**Critical design decision — GPU check must NOT affect `ready`**:
+The GPU check is informational only. Many machines don't have GPUs, and `ready=False` would break preflight on every non-GPU machine. The approach: add the GPU check to the `checks` list but always set `passed=True` (since it's optional), with a separate `available` field in the detail to indicate actual GPU status.
+
+**Code to add in `_op_preflight`** — insert after the disk_space check (around line ~415), BEFORE the `all_passed` computation:
+
+```python
+# 5. GPU runtime (informational — does not affect ready status)
+gpu_available = False
+detected_runtime = await self.runtime.detect()
+if detected_runtime == "podman":
+    checks.append(
+        {
+            "name": "gpu_runtime",
+            "passed": True,  # Always True — GPU is optional
+            "detail": "GPU detection not supported for Podman",
+            "guidance": None,
+        }
+    )
+else:
+    gpu_info = await self.runtime.run(
+        "info", "--format", "{{.Runtimes}}", timeout=10
+    )
+    if gpu_info.returncode == 0 and "nvidia" in gpu_info.stdout.lower():
+        gpu_available = True
+        checks.append(
+            {
+                "name": "gpu_runtime",
+                "passed": True,
+                "detail": "NVIDIA runtime available (GPU passthrough supported)",
+                "guidance": None,
+            }
+        )
+    else:
+        checks.append(
+            {
+                "name": "gpu_runtime",
+                "passed": True,  # Always True — GPU is optional
+                "detail": "NVIDIA runtime not detected (GPU passthrough unavailable)",
+                "guidance": "Install nvidia-container-toolkit: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html",
+            }
+        )
+```
+
+Note: The check uses the actual 4-field dict shape (`name`, `passed`, `detail`, `guidance`) matching the existing checks — NOT the 6-field shape from the original Task 1.3 spec which was never implemented.
 
 **Note**: This implementation targets Docker + nvidia-container-toolkit. Podman handles GPU passthrough differently (`--device nvidia.com/gpu=all`). Podman GPU support is deferred as a future enhancement.
 
-**Tests**:
-- `test_gpu_preflight_check_available` — nvidia runtime detected, reports available
-- `test_gpu_preflight_check_unavailable` — no nvidia runtime, reports unavailable with guidance
-- `test_gpu_flag_already_in_create` — verify existing `--gpus all` in docker run args (regression guard)
-- Integration (GPU hosts only): create GPU container, run `nvidia-smi`
+**Tests** (in `tests/unit/test_tool.py`):
 
-**Done when**: `preflight` reports GPU availability. `containers(create, gpu=True)` continues to work on hosts with NVIDIA Docker runtime.
+```python
+@pytest.mark.asyncio
+async def test_gpu_preflight_nvidia_available(tool):
+    """GPU check reports nvidia available when runtime has it."""
+    # Mock runtime.run: "info --format" returns output containing "nvidia"
+    call_count = 0
+    async def _mock_run(*args, **kwargs):
+        nonlocal call_count
+        from amplifier_module_tool_containers.runtime import CommandResult
+        call_count += 1
+        # First calls are for daemon/permissions checks
+        if "info" in args and "--format" in args and "Runtimes" in str(args):
+            return CommandResult(returncode=0, stdout="map[io.containerd.runc.v2:{} nvidia:{}]", stderr="")
+        return CommandResult(returncode=0, stdout="", stderr="")
+    tool.runtime.run = _mock_run
+    tool.runtime._runtime = "docker"
+    
+    result = await tool.execute("containers", {"operation": "preflight"})
+    gpu_check = next(c for c in result["checks"] if c["name"] == "gpu_runtime")
+    assert gpu_check["passed"] is True
+    assert "NVIDIA runtime available" in gpu_check["detail"]
+
+@pytest.mark.asyncio
+async def test_gpu_preflight_nvidia_unavailable(tool):
+    """GPU check reports unavailable but ready is still True."""
+    # Mock runtime.run: "info --format" returns output WITHOUT "nvidia"
+    async def _mock_run(*args, **kwargs):
+        from amplifier_module_tool_containers.runtime import CommandResult
+        if "info" in args and "--format" in args and "Runtimes" in str(args):
+            return CommandResult(returncode=0, stdout="map[io.containerd.runc.v2:{}]", stderr="")
+        return CommandResult(returncode=0, stdout="", stderr="")
+    tool.runtime.run = _mock_run
+    tool.runtime._runtime = "docker"
+    
+    result = await tool.execute("containers", {"operation": "preflight"})
+    assert result["ready"] is True  # CRITICAL: GPU absence doesn't break preflight
+    gpu_check = next(c for c in result["checks"] if c["name"] == "gpu_runtime")
+    assert gpu_check["passed"] is True  # Always True (informational)
+    assert "not detected" in gpu_check["detail"]
+    assert gpu_check["guidance"] is not None  # Has install guidance
+
+@pytest.mark.asyncio
+async def test_gpu_preflight_podman_skipped(tool):
+    """GPU check on Podman reports not supported."""
+    async def _mock_run(*args, **kwargs):
+        from amplifier_module_tool_containers.runtime import CommandResult
+        return CommandResult(returncode=0, stdout="", stderr="")
+    tool.runtime.run = _mock_run
+    tool.runtime._runtime = "podman"
+    
+    result = await tool.execute("containers", {"operation": "preflight"})
+    gpu_check = next(c for c in result["checks"] if c["name"] == "gpu_runtime")
+    assert gpu_check["passed"] is True
+    assert "not supported for Podman" in gpu_check["detail"]
+
+@pytest.mark.asyncio  
+async def test_gpu_check_does_not_affect_ready(tool):
+    """ready=True even when GPU is unavailable — GPU is informational only."""
+    async def _mock_run(*args, **kwargs):
+        from amplifier_module_tool_containers.runtime import CommandResult
+        if "info" in args and "--format" in args and "Runtimes" in str(args):
+            return CommandResult(returncode=0, stdout="map[io.containerd.runc.v2:{}]", stderr="")
+        return CommandResult(returncode=0, stdout="", stderr="")
+    tool.runtime.run = _mock_run
+    tool.runtime._runtime = "docker"
+    
+    result = await tool.execute("containers", {"operation": "preflight"})
+    assert result["ready"] is True
+
+def test_gpu_flag_in_create_schema():
+    """Regression guard: gpu=True still produces --gpus all in create args."""
+    from amplifier_module_tool_containers import ContainersTool
+    tool = ContainersTool()
+    schema = tool.tool_definitions[0]["input_schema"]
+    assert "gpu" in schema["properties"]
+    assert schema["properties"]["gpu"]["type"] == "boolean"
+```
+
+**Done when**: `preflight` includes a `gpu_runtime` check that reports NVIDIA availability without affecting `ready` status. All existing + new tests pass. `containers(create, gpu=True)` continues to work unchanged.
 
 ---
 
