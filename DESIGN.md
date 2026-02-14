@@ -120,11 +120,17 @@ includes:
 
 ---
 
-### 4.4 Host UID/GID Mapping (Default)
+### 4.4 Two-Phase User Model
 
-Containers default to matching the host user's UID/GID for mounted volumes. This prevents the common friction of files created inside the container being owned by root on the host.
+Containers run as root for full admin capability during setup. A user matching the host UID/GID is created inside the container. After setup, exec commands run as the mapped user by default for correct file ownership on mounted volumes.
 
-Implementation: `--user $(id -u):$(id -g)` is added to `docker run` by default. Provisioning paths adapt to use the mapped user's home directory instead of hardcoded `/root/`. A `user` parameter on `create` allows override when needed (e.g., `user="root"` for system-level work).
+```
+docker run ... (root)                           ← Setup phase: apt-get, pip install work
+docker exec --user UID:GID container command    ← Exec phase: files owned by host user
+docker exec container command                   ← Admin: as_root=True, full root access
+```
+
+This design preserves `--security-opt=no-new-privileges` (sudo not needed — the Docker daemon handles user switching via `docker exec --user`). A `user` parameter on `create` allows override, and `as_root=True` on `exec` gives admin access at any time.
 
 ## 5. Tool Operations API
 
@@ -334,11 +340,11 @@ Independent. Shadow's value is Gitea + git URL rewriting + source snapshotting. 
 ### Phase 1: Core MVP — COMPLETE
 Runtime detection, preflight, create/exec/destroy, env passthrough, git/GH/SSH forwarding, dotfiles, purpose profiles, CWD mount, tracking, context docs, snapshots, networks. 54 tests (43 unit + 11 integration).
 
-### Phase 2: Production Readiness
-UID/GID mapping, provisioning report, local image caching, try-repo auto-detection, background exec with polling, dev infrastructure (root pyproject.toml, pytest config).
+### Phase 2: Production Readiness — COMPLETE
+UID/GID mapping, provisioning report, local image caching, try-repo auto-detection, background exec with polling, dev infrastructure. 103 tests (87 unit + 16 integration).
 
-### Phase 3: Amplifier-in-Container
-Amplifier purpose profile polish (settings forwarding, bundle config), multi-container orchestration patterns.
+### Phase 3: Two-Phase User Model + Amplifier-in-Container
+Refactor to two-phase user model (root setup, mapped user exec), amplifier purpose profile polish (settings forwarding, parallel-agents pattern), documentation refresh.
 
 ### Phase 4: Extended Capabilities
 GPU passthrough, Docker Compose pass-through (with pro/con evaluation), curated image publishing (when ready).

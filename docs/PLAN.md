@@ -1202,20 +1202,144 @@ async def _op_exec_cancel(self, inp: dict) -> dict:
 
 ---
 
-## Phase 3: Amplifier-in-Container
+## Phase 3: Two-Phase User Model + Amplifier-in-Container
 
-> Goal: Polish the amplifier purpose profile and multi-container orchestration for the parallel-agents use case.
+> Goal: Refactor the user model so containers run as root (full admin for setup) while exec commands run as the mapped host user (correct file ownership). Then polish the amplifier purpose profile for the parallel-agents use case.
 
-### Task 3.1: Amplifier Purpose Profile Polish
+> **Key insight from Phase 2 review**: The current `--user UID:GID` on `docker run` prevents `apt-get install` and `pip install` from working during setup because the non-root user can't write to system paths. Additionally, `--security-opt=no-new-privileges` (our security hardening) prevents sudo from working inside containers. The solution: run the container as root, create a user matching the host UID:GID inside, run setup as root, then exec user commands with `docker exec --user UID:GID`.
 
-**What**: Make `purpose="amplifier"` production-ready for running Amplifier inside containers.
+### Task 3.1: Refactor to Two-Phase User Model
+
+**What**: Move `--user` from `docker run` to `docker exec`. Container runs as root (setup works), exec commands run as mapped user (file ownership correct). Add `as_root` parameter for post-setup admin access.
+
+**Files to modify**:
+- `modules/tool-containers/amplifier_module_tool_containers/__init__.py` — `_op_create`, `_op_exec`, `_op_exec_background`, `_op_exec_poll`
+- `modules/tool-containers/amplifier_module_tool_containers/runtime.py` — Add `exec_user` support
+- `modules/tool-containers/amplifier_module_tool_containers/provisioner.py` — Target user home for provisioning
+- `tests/unit/test_provisioner.py` — Update UID mapping tests
+- `tests/unit/test_tool.py` — Update exec tests
+
+**Architecture change**:
+```
+BEFORE (Phase 2):
+  docker run --user 1000:1000 ...     ← Non-root, setup fails
+  docker exec container apt-get ...   ← Inherits non-root → FAILS
+
+AFTER (Phase 3):
+  docker run ... (no --user)          ← Root, setup works
+  docker exec --user 1000:1000 container python app.py  ← Mapped user
+  docker exec container pip install X                    ← Root (as_root)
+```
+
+**Changes**:
+
+1. **Remove `--user` from `docker run` in `_op_create`**:
+   - Remove the current UID/GID mapping block that adds `--user` to run args
+   - Instead, compute and store `exec_user` in metadata:
+     ```python
+     exec_user = None
+     if inp.get("user") is None and (inp.get("mount_cwd", True) or inp.get("mounts")):
+         exec_user = f"{os.getuid()}:{os.getgid()}"
+     elif inp.get("user") and inp.get("user") != "root":
+         exec_user = inp.get("user")
+     ```
+   - Store `exec_user` in metadata.json
+
+2. **Create user inside container during setup** (after container starts, before other setup):
+   ```python
+   if exec_user:
+       uid, gid = exec_user.split(":")
+       user_cmds = [
+           f"groupadd -g {gid} -o hostuser 2>/dev/null || true",
+           f"useradd -u {uid} -g {gid} -m -s /bin/bash -o hostuser 2>/dev/null || true",
+       ]
+       for cmd in user_cmds:
+           await self.runtime.run("exec", name, "/bin/sh", "-c", cmd, timeout=30)
+   ```
+
+3. **Setup commands and provisioning run as root** (no change needed — container is root, exec without --user is root).
+
+4. **Provisioning targets the created user's home**:
+   - When `exec_user` is set, provision to `/home/hostuser` instead of detecting via `$HOME`
+   - Update `ContainerProvisioner` to accept a `target_home` parameter
+
+5. **Chown workspace after setup**:
+   ```python
+   if exec_user:
+       await self.runtime.run(
+           "exec", name, "/bin/sh", "-c",
+           f"chown -R {exec_user} /workspace 2>/dev/null || true",
+           timeout=30,
+       )
+   ```
+
+6. **Modify `_op_exec` to use exec_user by default**:
+   ```python
+   async def _op_exec(self, inp):
+       container = inp["container"]
+       metadata = self.store.load(container)
+       exec_user = None if inp.get("as_root", False) else (metadata or {}).get("exec_user")
+       
+       result = await self.runtime.run(
+           "exec", **({"exec_user": exec_user} if exec_user else {}),
+           container, "/bin/sh", "-c", inp["command"],
+           timeout=inp.get("timeout", 300),
+       )
+   ```
+
+7. **Modify `runtime.py` `run()` method** to accept optional `exec_user` parameter:
+   - When the first arg is "exec" and `exec_user` is provided, insert `--user {exec_user}` after "exec"
+
+8. **Add `as_root` to tool schema**:
+   ```python
+   "as_root": {
+       "type": "boolean",
+       "default": False,
+       "description": "Run command as root instead of mapped user (for package installation, system changes)",
+   },
+   ```
+
+9. **Update `_op_exec_background` and `_op_exec_poll`** to also respect exec_user from metadata (and as_root override).
+
+10. **Update `_op_exec_interactive_hint`** to include the user flag:
+    ```python
+    # If exec_user is set, hint should include --user
+    if exec_user:
+        return {"command": f"{runtime} exec -it --user {exec_user} {container} {shell}", ...}
+    ```
+
+**Tests**:
+- `test_create_no_user_flag_on_run` — docker run args do NOT contain --user
+- `test_create_stores_exec_user_in_metadata` — metadata has exec_user field
+- `test_create_creates_hostuser` — useradd command is called during setup
+- `test_create_chowns_workspace` — chown command runs after setup
+- `test_exec_uses_exec_user` — docker exec includes --user from metadata
+- `test_exec_as_root_skips_user` — as_root=True runs without --user
+- `test_exec_no_mounts_no_user` — when mount_cwd=False, no exec_user, runs as root
+- `test_exec_interactive_hint_includes_user` — hint command includes --user when exec_user set
+- `test_exec_background_uses_exec_user` — background exec respects mapped user
+- Update existing UID mapping tests from Phase 2 (they test --user on docker run, need to test exec_user in metadata + --user on docker exec instead)
+- Integration: create with mount_cwd, touch file via exec (should be host-owned), install package via exec with as_root=True (should work)
+
+**Done when**: Container runs as root, setup commands (apt-get, pip) work. Exec commands create files with correct host ownership. `as_root=True` gives admin access. All security hardening preserved.
+
+---
+
+### Task 3.2: Amplifier Purpose Profile Polish
+
+**What**: Make `purpose="amplifier"` production-ready for running Amplifier inside containers. Now works correctly because setup runs as root.
+
+**Files to modify**:
+- `modules/tool-containers/amplifier_module_tool_containers/images.py` — Update amplifier profile
+- `modules/tool-containers/amplifier_module_tool_containers/__init__.py` — Add amplifier-specific provisioning
+- `modules/tool-containers/amplifier_module_tool_containers/provisioner.py` — Add settings forwarding
 
 **Enhanced profile**:
 1. Forward `~/.amplifier/settings.yaml` if it exists
-2. Forward `~/.amplifier/settings.local.yaml` if it exists
+2. Forward `~/.amplifier/settings.local.yaml` if it exists  
 3. Accept `amplifier_bundle` parameter — bundle name/URI to configure inside the container
 4. Accept `amplifier_version` parameter — pin amplifier version (default: latest)
-5. Set up proper PATH for `uv tool` binaries
+5. Set up proper PATH for `uv tool` binaries (`/root/.local/bin` since uv installs as root during setup)
 
 **Additional create parameters**:
 ```python
@@ -1223,41 +1347,97 @@ async def _op_exec_cancel(self, inp: dict) -> dict:
 "amplifier_version": {"type": "string", "description": "Amplifier version to install (default: latest)"},
 ```
 
+**Provisioner addition** — `provision_amplifier_settings()`:
+```python
+async def provision_amplifier_settings(self, container: str, target_home: str) -> ProvisioningStep:
+    """Forward Amplifier settings into the container."""
+    home = Path.home()
+    amplifier_dir = home / ".amplifier"
+    if not amplifier_dir.exists():
+        return ProvisioningStep("amplifier_settings", "skipped", "No ~/.amplifier directory on host")
+    
+    # Create target directory
+    await self.runtime.run("exec", container, "/bin/sh", "-c",
+        f"mkdir -p {target_home}/.amplifier", timeout=5)
+    
+    files_copied = []
+    for settings_file in ["settings.yaml", "settings.local.yaml"]:
+        src = amplifier_dir / settings_file
+        if src.exists():
+            await self.runtime.run("cp", str(src),
+                f"{container}:{target_home}/.amplifier/{settings_file}", timeout=10)
+            files_copied.append(settings_file)
+    
+    if not files_copied:
+        return ProvisioningStep("amplifier_settings", "skipped", "No settings files found")
+    return ProvisioningStep("amplifier_settings", "success", f"Copied {', '.join(files_copied)}")
+```
+
 **Tests**:
-- `test_amplifier_profile_installs_amplifier` — amplifier CLI available inside container
-- `test_amplifier_profile_forwards_settings` — settings.yaml copied
-- `test_amplifier_profile_custom_bundle` — bundle configured inside container
+- `test_amplifier_profile_setup_commands` — verify profile includes uv + amplifier install
+- `test_amplifier_profile_forwards_all_creds` — forward_git, forward_gh both true
+- `test_amplifier_settings_forwarded` — settings.yaml copied when present
+- `test_amplifier_settings_skipped` — skipped when no ~/.amplifier
+- `test_amplifier_version_param` — version param modifies install command
+- `test_amplifier_bundle_param` — bundle param adds configuration command
 - Integration: create amplifier container, run `amplifier --version`, verify output
 
-**Done when**: `containers(create, purpose="amplifier")` produces a container where Amplifier just works.
+**Done when**: `containers(create, purpose="amplifier")` produces a container where Amplifier just works, including settings forwarding and credential passthrough.
 
 ---
 
-### Task 3.2: Update Operator Agent and Context
+### Task 3.3: Update All Context Docs + README
 
-**What**: Update container-operator.md and container-guide.md to cover Phase 2 features.
+**What**: Refresh all documentation to reflect Phase 2 and Phase 3 features.
 
-**Update `context/container-guide.md`**:
-- Add provisioning report documentation (what each status means)
-- Add image caching documentation (cache_bust, cache_clear)
-- Add try-repo documentation with examples
-- Add background exec documentation (exec_background/poll/cancel)
-- Add UID mapping documentation (user parameter, when to use root)
-- Update troubleshooting section
+**Files to modify**:
+- `context/container-awareness.md` — Thin root context (every session sees this)
+- `context/container-guide.md` — Heavy operator agent context
+- `agents/container-operator.md` — Operator agent instructions
+- `README.md` — User-facing documentation
+- `DESIGN.md` — Mark Phase 2 complete, update architecture description
+- `docs/PLAN.md` — Fix test counts
 
-**Update `agents/container-operator.md`**:
-- Add try-repo pattern to operating principles
+**`container-awareness.md` updates**:
+- Add try-repo to purpose table
+- Add provisioning report mention ("create returns structured report — no need to investigate")
+- Add background exec operations (exec_background, exec_poll, exec_cancel) to quick reference
+- Add cache_clear to operations list
+- Add `as_root` parameter mention
+- Add `repo_url` parameter mention
+- Update patterns section with parallel-agents pattern using exec_background
+
+**`container-guide.md` updates**:
+- Add provisioning report section (what each status means, example output)
+- Add image caching section (cache_bust, cache_clear, how invalidation works)
+- Add try-repo section with detection rules and examples
+- Add background exec section (exec_background/poll/cancel lifecycle)
+- Add UID/user model section (exec_user, as_root, when to use root)
+- Add parallel-agents pattern (create N amplifier containers + exec_background)
+- Update troubleshooting section with Phase 2/3 scenarios
+
+**`container-operator.md` updates**:
+- Add try-repo to operating principles
 - Add background exec pattern for long-running tasks
 - Add image cache management guidance
+- Add parallel-agents orchestration pattern
 
-**Update `context/container-awareness.md`**:
-- Add try-repo to purpose table
-- Add provisioning report mention (caller knows what happened)
-- Add background exec operations to quick reference
+**`README.md` updates**:
+- Add Phase 2 features to feature list (try-repo, background exec, provisioning report, caching)
+- Add `as_root` to exec documentation
+- Update operations table
+- Update purpose table with try-repo
+
+**`DESIGN.md` updates**:
+- Phase 2 marked COMPLETE in implementation phases section
+- Update section 4.4 (UID mapping) to describe the two-phase user model
+
+**`PLAN.md` updates**:
+- Fix test count section (currently says "Total target: ~80 tests", actual is 103+)
 
 **Tests**: N/A (documentation)
 
-**Done when**: All context docs reflect the current feature set.
+**Done when**: All docs accurately reflect the current feature set. A developer reading container-awareness.md knows about all available features. README accurately describes the bundle.
 
 ---
 
@@ -1348,5 +1528,6 @@ pytest tests/ -v -m "not integration"
 
 ### Current Test Count
 - Phase 1: 43 unit + 11 integration = 54 tests
-- Phase 2 target: ~20 additional unit + ~7 integration
-- Total target: ~80 tests
+- Phase 2: +49 tests = 103 total (87 unit + 16 integration)
+- Phase 3 target: ~15 additional tests
+- Total target: ~118 tests
