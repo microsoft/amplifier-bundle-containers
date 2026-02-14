@@ -1497,6 +1497,8 @@ async def provision_amplifier_settings(self, container: str, target_home: str) -
 - The check should report whether GPU passthrough is available, not fail if it isn't (GPU is optional)
 - Include guidance when GPU is requested but runtime is not available (install `nvidia-container-toolkit`)
 
+**Note**: This implementation targets Docker + nvidia-container-toolkit. Podman handles GPU passthrough differently (`--device nvidia.com/gpu=all`). Podman GPU support is deferred as a future enhancement.
+
 **Tests**:
 - `test_gpu_preflight_check_available` — nvidia runtime detected, reports available
 - `test_gpu_preflight_check_unavailable` — no nvidia runtime, reports unavailable with guidance
@@ -1507,37 +1509,9 @@ async def provision_amplifier_settings(self, container: str, target_home: str) -
 
 ---
 
-### Task 4.2: Docker Compose Evaluation and Implementation
+### Task 4.2: Docker Compose — DEFERRED
 
-**What**: Evaluate whether to add Docker Compose pass-through, then implement if warranted.
-
-**Before implementation**, prepare a pro/con brief for the user:
-
-**What Compose gives you**:
-- Declarative multi-service definition in a single YAML file
-- Automatic network creation between services
-- Volume management and data persistence
-- Health checks and dependency ordering (service A waits for service B)
-- One-command teardown of entire stacks
-- Widely adopted format — many projects ship a docker-compose.yml
-
-**What you lose / trade off**:
-- Another YAML format to understand (vs our `create` + `create_network` approach)
-- Compose files may conflict with our container tracking (labels, metadata)
-- Users need `docker compose` plugin installed (additional prerequisite)
-- Less granular control than individual `create` calls
-- Our provisioning pipeline (env forwarding, dotfiles, etc.) doesn't apply to compose services
-
-**Recommendation**: Compose is most useful when users already have a docker-compose.yml they want to use. Our create+network approach is better for agent-driven orchestration. Both can coexist.
-
-**If approved**, implement:
-- `compose_up(compose_file, project_name)` — `docker compose -f file up -d`
-- `compose_down(project_name)` — `docker compose down`
-- `compose_status(project_name)` — `docker compose ps --format json`
-
-**Tests**: Standard lifecycle tests with a simple compose file (nginx + redis).
-
-**Done when**: User has made an informed decision. If approved, compose operations work.
+Docker Compose pass-through has been deferred for future evaluation. The current `create` + `create_network` approach handles multi-service scenarios. Compose will be revisited if there's demand for users with existing docker-compose.yml files.
 
 ---
 
@@ -1569,5 +1543,6 @@ pytest tests/ -v -m "not integration"
 ### Current Test Count
 - Phase 1: 43 unit + 11 integration = 54 tests
 - Phase 2: +49 tests = 103 total (87 unit + 16 integration)
-- Phase 3 target: ~15 additional tests
-- Total target: ~118 tests
+- Phase 3: +20 tests = 123 total (107 unit + 16 integration)
+- Phase 4 target: ~5 additional tests
+- Total target: ~128 tests
