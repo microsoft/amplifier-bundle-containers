@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Add tool module to sys.path for test discovery
+sys.path.insert(0, str(Path(__file__).parent.parent / "modules" / "tool-containers"))
+
 import pytest
 
 from amplifier_module_tool_containers import ContainersTool, MetadataStore
