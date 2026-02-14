@@ -393,3 +393,92 @@ async def test_create_uses_cached_image(tool: ContainersTool):
     assert not any("apt-get" in c for c in executed_commands)
     # User's explicit command should still have been executed
     assert "echo user-cmd" in executed_commands
+
+
+# ---------------------------------------------------------------------------
+# Try-repo auto-detection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_try_repo_requires_url(tool: ContainersTool):
+    """try-repo purpose without repo_url returns error."""
+    tool._preflight_passed = True
+    result = await tool.execute(
+        "containers",
+        {"operation": "create", "purpose": "try-repo"},
+    )
+    assert "error" in result
+    assert "repo_url" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_try_repo_adds_clone_to_setup(tool: ContainersTool):
+    """try-repo adds git clone to setup_commands and resolves detected purpose."""
+    tool._preflight_passed = True
+    executed_commands: list[str] = []
+
+    async def _mock_run(*args: str, **kwargs: object) -> CommandResult:
+        if args and args[0] == "exec" and len(args) > 4:
+            executed_commands.append(args[4])
+        if args and args[0] == "run":
+            return CommandResult(0, "abc123def456\n", "")
+        # No cache
+        if args and args[0] == "image":
+            return CommandResult(1, "", "No such image")
+        # commit succeeds
+        if args and args[0] == "commit":
+            return CommandResult(0, "sha256:abc\n", "")
+        return CommandResult(0, "/root\n", "")
+
+    tool.runtime.run = _mock_run  # type: ignore[assignment]
+    tool.provisioner.runtime.run = _mock_run  # type: ignore[assignment]
+
+    with (
+        patch("amplifier_module_tool_containers.provisioner.shutil.which", return_value=None),
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+        patch(
+            "amplifier_module_tool_containers.images.detect_repo_purpose",
+            return_value=(
+                "python",
+                [
+                    'uv pip install -e ".[dev]" 2>/dev/null || pip install -e ".[dev]" 2>/dev/null || true'
+                ],
+            ),
+        ),
+    ):
+        mock_home = mock_path.home.return_value
+        no_file = type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: "/fake/.gitconfig"}
+        )()
+        mock_home.__truediv__ = lambda self, key: no_file
+
+        result = await tool.execute(
+            "containers",
+            {
+                "operation": "create",
+                "name": "test-tryrepo",
+                "purpose": "try-repo",
+                "repo_url": "https://github.com/example/repo.git",
+                "forward_git": False,
+                "forward_gh": False,
+                "forward_ssh": False,
+                "dotfiles_skip": True,
+            },
+        )
+
+    assert result.get("success") is True
+    # Purpose should have been resolved to python (not try-repo)
+    assert result["purpose"] == "python"
+    # First setup command should be the git clone
+    assert any("git clone" in c for c in executed_commands)
+    assert any("https://github.com/example/repo.git" in c for c in executed_commands)
+
+
+@pytest.mark.asyncio
+async def test_try_repo_schema_includes_repo_url(tool: ContainersTool):
+    """repo_url is present in the tool input schema."""
+    defs = tool.tool_definitions
+    schema = defs[0]["input_schema"]
+    assert "repo_url" in schema["properties"]
+    assert schema["properties"]["repo_url"]["type"] == "string"

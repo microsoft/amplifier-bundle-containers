@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import shutil as _shutil
+import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -131,3 +134,83 @@ def resolve_purpose(purpose: str, explicit: dict[str, Any]) -> dict[str, Any]:
         merged["env"] = merged_env
 
     return merged
+
+
+# ---------------------------------------------------------------------------
+# Try-repo auto-detection
+# ---------------------------------------------------------------------------
+
+# Detection rules in priority order
+REPO_MARKERS: list[tuple[str, str]] = [
+    ("Cargo.toml", "rust"),
+    ("pyproject.toml", "python"),
+    ("setup.py", "python"),
+    ("requirements.txt", "python"),
+    ("package.json", "node"),
+    ("go.mod", "go"),
+]
+
+
+async def detect_repo_purpose(repo_url: str) -> tuple[str, list[str]]:
+    """Shallow clone repo on HOST, inspect files, return (purpose, setup_hints).
+
+    Uses git directly on the host (not container runtime) since this runs
+    BEFORE the container is created to determine which purpose profile to use.
+    Clone is done via asyncio.create_subprocess_exec into a temp directory
+    that is cleaned up after inspection.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="amp-tryrepo-")
+    try:
+        # Shallow clone
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "clone",
+            "--depth=1",
+            "--quiet",
+            repo_url,
+            tmpdir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        if proc.returncode != 0:
+            return "general", []
+
+        # Detect purpose from file markers
+        from pathlib import Path
+
+        repo_path = Path(tmpdir)
+        detected_purpose = "general"
+        for marker_file, purpose in REPO_MARKERS:
+            if (repo_path / marker_file).exists():
+                detected_purpose = purpose
+                break
+
+        # Generate setup hints based on what we found
+        setup_hints: list[str] = []
+        if detected_purpose == "python":
+            if (repo_path / "pyproject.toml").exists():
+                setup_hints.append(
+                    'uv pip install -e ".[dev]" 2>/dev/null || pip install -e ".[dev]" 2>/dev/null || true'
+                )
+            elif (repo_path / "requirements.txt").exists():
+                setup_hints.append(
+                    "uv pip install -r requirements.txt 2>/dev/null || pip install -r requirements.txt"
+                )
+        elif detected_purpose == "node":
+            setup_hints.append("npm install")
+        elif detected_purpose == "rust":
+            setup_hints.append("cargo build 2>/dev/null || true")
+        elif detected_purpose == "go":
+            setup_hints.append("go build ./... 2>/dev/null || true")
+
+        # If Makefile exists, add make as a hint
+        if (repo_path / "Makefile").exists():
+            setup_hints.append("make 2>/dev/null || true")
+
+        return detected_purpose, setup_hints
+
+    except asyncio.TimeoutError:
+        return "general", []
+    finally:
+        _shutil.rmtree(tmpdir, ignore_errors=True)

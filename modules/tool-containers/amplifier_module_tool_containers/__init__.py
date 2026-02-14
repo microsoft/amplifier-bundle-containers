@@ -166,6 +166,10 @@ class ContainersTool:
                                 "general, amplifier, try-repo, clean"
                             ),
                         },
+                        "repo_url": {
+                            "type": "string",
+                            "description": "Git URL to clone (used with purpose='try-repo')",
+                        },
                         "command": {
                             "type": "string",
                             "description": "Command to execute (for exec)",
@@ -403,8 +407,30 @@ class ContainersTool:
         }
 
     async def _op_create(self, inp: dict[str, Any]) -> dict[str, Any]:
-        # Resolve purpose profile
+        # Handle try-repo auto-detection
         purpose = inp.get("purpose")
+        if purpose == "try-repo":
+            repo_url = inp.get("repo_url")
+            if not repo_url:
+                return {"error": "repo_url is required when purpose is 'try-repo'"}
+
+            from .images import detect_repo_purpose
+
+            detected_purpose, setup_hints = await detect_repo_purpose(repo_url)
+            inp["purpose"] = detected_purpose
+            purpose = detected_purpose
+
+            # Prepend clone + cd + setup hints to setup_commands
+            user_setup = inp.get("setup_commands", [])
+            inp["setup_commands"] = (
+                [
+                    f"git clone {repo_url} /workspace/repo",
+                ]
+                + [f"cd /workspace/repo && {hint}" for hint in setup_hints]
+                + user_setup
+            )
+
+        # Resolve purpose profile
         if purpose:
             inp = resolve_purpose(purpose, inp)
 
