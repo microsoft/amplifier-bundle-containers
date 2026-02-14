@@ -222,6 +222,11 @@ class ContainersTool:
                             "type": "string",
                             "description": "Container user (default: host UID:GID for mounted volumes, 'root' for root access)",
                         },
+                        "as_root": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Run command as root instead of mapped user (for package installation, system changes)",
+                        },
                         "force": {"type": "boolean", "default": False},
                         "confirm": {"type": "boolean", "default": False},
                         "health_check": {"type": "boolean", "default": False},
@@ -472,7 +477,6 @@ class ContainersTool:
             "-w",
             workdir,
             # Security hardening
-            "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
             f"--memory={inp.get('memory_limit', '4g')}",
             f"--pids-limit={self.config.get('security', {}).get('pids_limit', 256)}",
@@ -520,15 +524,13 @@ class ContainersTool:
         for key, value in env_vars.items():
             args.extend(["-e", f"{key}={value}"])
 
-        # Default to host UID:GID for proper file ownership on mounted volumes
-        user_flag = inp.get("user")
-        if user_flag is None and (inp.get("mount_cwd", True) or inp.get("mounts")):
-            uid = os.getuid()
-            gid = os.getgid()
-            user_flag = f"{uid}:{gid}"
-
-        if user_flag and user_flag != "root":
-            args.extend(["--user", user_flag])
+        # Compute exec_user for later use in docker exec (NOT docker run)
+        # Container runs as root for setup; exec commands use mapped user
+        exec_user = inp.get("user")
+        if exec_user is None and (inp.get("mount_cwd", True) or inp.get("mounts")):
+            exec_user = f"{os.getuid()}:{os.getgid()}"
+        if exec_user == "root":
+            exec_user = None  # root means no --user flag needed
 
         # Labels
         now = datetime.now(timezone.utc).isoformat()
@@ -558,6 +560,19 @@ class ContainersTool:
 
         container_id = result.stdout.strip()[:12]
 
+        # Create user matching host UID:GID inside the container
+        if exec_user:
+            uid, gid = exec_user.split(":")
+            user_cmds = [
+                f"groupadd -g {gid} -o hostuser 2>/dev/null || true",
+                f"useradd -u {uid} -g {gid} -m -s /bin/bash -o hostuser 2>/dev/null || true",
+            ]
+            for cmd in user_cmds:
+                await self.runtime.run("exec", name, "/bin/sh", "-c", cmd, timeout=30)
+
+        # Determine target home for provisioning
+        target_home = "/home/hostuser" if exec_user else None
+
         # Collect provisioning report
         report: list[ProvisioningStep] = []
 
@@ -568,19 +583,19 @@ class ContainersTool:
 
         # Git config
         if inp.get("forward_git", True):
-            report.append(await self.provisioner.provision_git(name))
+            report.append(await self.provisioner.provision_git(name, target_home=target_home))
         else:
             report.append(ProvisioningStep("forward_git", "skipped", "Not requested"))
 
         # GH auth
         if inp.get("forward_gh", True):
-            report.append(await self.provisioner.provision_gh_auth(name))
+            report.append(await self.provisioner.provision_gh_auth(name, target_home=target_home))
         else:
             report.append(ProvisioningStep("forward_gh", "skipped", "Not requested"))
 
         # SSH permissions
         if inp.get("forward_ssh", False):
-            report.append(await self.provisioner.fix_ssh_permissions(name))
+            report.append(await self.provisioner.fix_ssh_permissions(name, target_home=target_home))
         else:
             report.append(ProvisioningStep("forward_ssh", "skipped", "Not requested"))
 
@@ -635,6 +650,17 @@ class ContainersTool:
                 )
             )
 
+        # Fix workspace ownership for the mapped user
+        if exec_user:
+            await self.runtime.run(
+                "exec",
+                name,
+                "/bin/sh",
+                "-c",
+                f"chown -R {exec_user} /workspace 2>/dev/null || true",
+                timeout=60,
+            )
+
         # Save metadata
         self.store.save(
             name,
@@ -649,6 +675,7 @@ class ContainersTool:
                 "mount_cwd": inp.get("mount_cwd", True),
                 "ports": inp.get("ports", []),
                 "env_keys": list(env_vars.keys()),
+                "exec_user": exec_user,
                 "provisioning": {
                     "forward_git": inp.get("forward_git", True),
                     "forward_gh": inp.get("forward_gh", True),
@@ -664,7 +691,10 @@ class ContainersTool:
 
         # Get interactive hint
         runtime_name = await self.runtime.detect()
-        hint = f"{runtime_name} exec -it {name} /bin/bash"
+        if exec_user:
+            hint = f"{runtime_name} exec -it --user {exec_user} {name} /bin/bash"
+        else:
+            hint = f"{runtime_name} exec -it {name} /bin/bash"
 
         return {
             "success": True,
@@ -689,9 +719,21 @@ class ContainersTool:
         timeout = inp.get("timeout", 300)
         if not container or not command:
             return {"error": "Both 'container' and 'command' are required"}
-        result = await self.runtime.run(
-            "exec", container, "/bin/sh", "-c", command, timeout=timeout
-        )
+
+        # Use mapped user by default, root if as_root=True
+        exec_user = None
+        if not inp.get("as_root", False):
+            metadata = self.store.load(container)
+            if metadata:
+                exec_user = metadata.get("exec_user")
+
+        # Build exec args with optional --user
+        exec_args = ["exec"]
+        if exec_user:
+            exec_args.extend(["--user", exec_user])
+        exec_args.extend([container, "/bin/sh", "-c", command])
+
+        result = await self.runtime.run(*exec_args, timeout=timeout)
         return {
             "returncode": result.returncode,
             "stdout": result.stdout,
@@ -703,21 +745,28 @@ class ContainersTool:
         container = inp.get("container", "")
         if not container:
             return {"error": "'container' is required"}
+
         runtime = await self.runtime.detect()
+        metadata = self.store.load(container)
+        exec_user = (metadata or {}).get("exec_user")
+
         # Detect best available shell
         for shell in ("/bin/bash", "/bin/zsh", "/bin/sh"):
-            result = await self.runtime.run("exec", container, "test", "-x", shell, timeout=5)
+            result = await self.runtime.run("exec", container, "test", "-x", shell, timeout=10)
             if result.returncode == 0:
-                return {
-                    "command": f"{runtime} exec -it {container} {shell}",
-                    "shell": shell,
-                    "container": container,
-                }
-        return {
-            "command": f"{runtime} exec -it {container} /bin/sh",
-            "shell": "/bin/sh",
-            "container": container,
-        }
+                if exec_user:
+                    cmd = f"{runtime} exec -it --user {exec_user} {container} {shell}"
+                else:
+                    cmd = f"{runtime} exec -it {container} {shell}"
+                return {"command": cmd, "shell": shell, "container": container}
+
+        # Fallback
+        shell = "/bin/sh"
+        if exec_user:
+            cmd = f"{runtime} exec -it --user {exec_user} {container} {shell}"
+        else:
+            cmd = f"{runtime} exec -it {container} {shell}"
+        return {"command": cmd, "shell": shell, "container": container}
 
     async def _op_list(self, _inp: dict[str, Any]) -> dict[str, Any]:
         result = await self.runtime.run(
@@ -884,6 +933,13 @@ class ContainersTool:
         if not container or not command:
             return {"error": "Both 'container' and 'command' are required"}
 
+        # Use mapped user by default, root if as_root=True
+        exec_user = None
+        if not inp.get("as_root", False):
+            metadata = self.store.load(container)
+            if metadata:
+                exec_user = metadata.get("exec_user")
+
         import uuid as _uuid
 
         job_id = _uuid.uuid4().hex[:8]
@@ -894,7 +950,13 @@ class ContainersTool:
             f"> /tmp/amp-job-{job_id}.out 2>&1 & "
             f"echo $! > /tmp/amp-job-{job_id}.pid && cat /tmp/amp-job-{job_id}.pid"
         )
-        result = await self.runtime.run("exec", container, "/bin/sh", "-c", bg_cmd, timeout=10)
+
+        exec_args = ["exec"]
+        if exec_user:
+            exec_args.extend(["--user", exec_user])
+        exec_args.extend([container, "/bin/sh", "-c", bg_cmd])
+
+        result = await self.runtime.run(*exec_args, timeout=10)
         pid = result.stdout.strip()
 
         return {

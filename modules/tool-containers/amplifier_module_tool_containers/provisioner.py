@@ -117,19 +117,23 @@ class ContainerProvisioner:
     def __init__(self, runtime: ContainerRuntime) -> None:
         self.runtime = runtime
 
-    async def get_container_home(self, container: str) -> str:
-        """Get the home directory of the container user."""
+    async def get_container_home(self, container: str, target_home: str | None = None) -> str:
+        """Get the home directory for provisioning targets."""
+        if target_home:
+            return target_home
         result = await self.runtime.run("exec", container, "/bin/sh", "-c", "echo $HOME", timeout=5)
         home = result.stdout.strip()
-        return home if home else "/root"
+        return home if home and home != "/" else "/root"
 
-    async def provision_git(self, container: str) -> ProvisioningStep:
+    async def provision_git(
+        self, container: str, target_home: str | None = None
+    ) -> ProvisioningStep:
         """Copy git configuration into the container."""
         host_home = Path.home()
         if not (host_home / ".gitconfig").exists():
             return ProvisioningStep("forward_git", "skipped", "No .gitconfig found on host")
 
-        home = await self.get_container_home(container)
+        home = await self.get_container_home(container, target_home=target_home)
         copied: list[str] = []
         for src_name, dst_name in [
             (".gitconfig", ".gitconfig"),
@@ -156,7 +160,9 @@ class ContainerProvisioner:
 
         return ProvisioningStep("forward_git", "success", f"Copied {' + '.join(copied)}")
 
-    async def provision_gh_auth(self, container: str) -> ProvisioningStep:
+    async def provision_gh_auth(
+        self, container: str, target_home: str | None = None
+    ) -> ProvisioningStep:
         """Forward GitHub CLI authentication into the container."""
         gh_path = shutil.which("gh")
         if not gh_path:
@@ -181,7 +187,7 @@ class ContainerProvisioner:
                 "forward_gh", "skipped", "gh CLI not authenticated — run 'gh auth login' on host"
             )
 
-        home = await self.get_container_home(container)
+        home = await self.get_container_home(container, target_home=target_home)
         # Inject as env vars
         bashrc = f"{home}/.bashrc"
         env_script = (
@@ -210,13 +216,15 @@ class ContainerProvisioner:
 
         return ProvisioningStep("forward_gh", "success", " + ".join(detail_parts))
 
-    async def fix_ssh_permissions(self, container: str) -> ProvisioningStep:
+    async def fix_ssh_permissions(
+        self, container: str, target_home: str | None = None
+    ) -> ProvisioningStep:
         """Fix SSH key permissions after bind mount.
 
         Copies keys from the read-only staging mount at /tmp/.host-ssh
         into the container user's home .ssh directory with correct permissions.
         """
-        home = await self.get_container_home(container)
+        home = await self.get_container_home(container, target_home=target_home)
         ssh_dir = f"{home}/.ssh"
         cmds = [
             f"mkdir -p {ssh_dir}",

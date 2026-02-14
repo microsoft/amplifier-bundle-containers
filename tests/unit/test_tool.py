@@ -611,3 +611,350 @@ async def test_exec_cancel_returns_cancelled(tool: ContainersTool, mock_successf
     )
     assert result["cancelled"] is True
     assert result["job_id"] == "abc12345"
+
+
+# ---------------------------------------------------------------------------
+# Two-phase user model
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_no_user_flag_on_run(tool: ContainersTool):
+    """docker run args do NOT contain --user (container runs as root)."""
+    tool._preflight_passed = True
+    captured_args: list[tuple[str, ...]] = []
+
+    async def _capture(*args: str, **kwargs: object) -> CommandResult:
+        captured_args.append(args)
+        if args and args[0] == "run":
+            return CommandResult(0, "abc123def456\n", "")
+        return CommandResult(0, "/root\n", "")
+
+    tool.runtime.run = _capture  # type: ignore[assignment]
+    tool.provisioner.runtime.run = _capture  # type: ignore[assignment]
+
+    with (
+        patch("amplifier_module_tool_containers.provisioner.shutil.which", return_value=None),
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        mock_home = mock_path.home.return_value
+        no_file = type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: "/fake/.gitconfig"}
+        )()
+        mock_home.__truediv__ = lambda self, key: no_file
+
+        await tool.execute(
+            "containers",
+            {
+                "operation": "create",
+                "name": "test-no-user-run",
+                "forward_git": False,
+                "forward_gh": False,
+            },
+        )
+
+    run_call = next(c for c in captured_args if c and c[0] == "run")
+    assert "--user" not in run_call
+
+
+@pytest.mark.asyncio
+async def test_create_stores_exec_user_in_metadata(tool: ContainersTool):
+    """create stores exec_user in metadata."""
+    import os
+
+    tool._preflight_passed = True
+
+    async def _mock_run(*args: str, **kwargs: object) -> CommandResult:
+        if args and args[0] == "run":
+            return CommandResult(0, "abc123def456\n", "")
+        return CommandResult(0, "/root\n", "")
+
+    tool.runtime.run = _mock_run  # type: ignore[assignment]
+    tool.provisioner.runtime.run = _mock_run  # type: ignore[assignment]
+
+    with (
+        patch("amplifier_module_tool_containers.provisioner.shutil.which", return_value=None),
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        mock_home = mock_path.home.return_value
+        no_file = type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: "/fake/.gitconfig"}
+        )()
+        mock_home.__truediv__ = lambda self, key: no_file
+
+        await tool.execute(
+            "containers",
+            {
+                "operation": "create",
+                "name": "test-meta",
+                "mount_cwd": True,
+                "forward_git": False,
+                "forward_gh": False,
+            },
+        )
+
+    metadata = tool.store.load("test-meta")
+    assert metadata is not None
+    assert "exec_user" in metadata
+    assert metadata["exec_user"] == f"{os.getuid()}:{os.getgid()}"
+
+
+@pytest.mark.asyncio
+async def test_create_creates_hostuser(tool: ContainersTool):
+    """useradd command is called during container setup."""
+    tool._preflight_passed = True
+    exec_commands: list[str] = []
+
+    async def _capture(*args: str, **kwargs: object) -> CommandResult:
+        if args and args[0] == "exec" and len(args) > 4:
+            exec_commands.append(args[4])
+        if args and args[0] == "run":
+            return CommandResult(0, "abc123def456\n", "")
+        return CommandResult(0, "/root\n", "")
+
+    tool.runtime.run = _capture  # type: ignore[assignment]
+    tool.provisioner.runtime.run = _capture  # type: ignore[assignment]
+
+    with (
+        patch("amplifier_module_tool_containers.provisioner.shutil.which", return_value=None),
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        mock_home = mock_path.home.return_value
+        no_file = type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: "/fake/.gitconfig"}
+        )()
+        mock_home.__truediv__ = lambda self, key: no_file
+
+        await tool.execute(
+            "containers",
+            {
+                "operation": "create",
+                "name": "test-hostuser",
+                "forward_git": False,
+                "forward_gh": False,
+            },
+        )
+
+    assert any("useradd" in cmd for cmd in exec_commands)
+    assert any("groupadd" in cmd for cmd in exec_commands)
+
+
+@pytest.mark.asyncio
+async def test_create_chowns_workspace(tool: ContainersTool):
+    """chown command runs after setup to fix workspace ownership."""
+    tool._preflight_passed = True
+    exec_commands: list[str] = []
+
+    async def _capture(*args: str, **kwargs: object) -> CommandResult:
+        if args and args[0] == "exec" and len(args) > 4:
+            exec_commands.append(args[4])
+        if args and args[0] == "run":
+            return CommandResult(0, "abc123def456\n", "")
+        return CommandResult(0, "/root\n", "")
+
+    tool.runtime.run = _capture  # type: ignore[assignment]
+    tool.provisioner.runtime.run = _capture  # type: ignore[assignment]
+
+    with (
+        patch("amplifier_module_tool_containers.provisioner.shutil.which", return_value=None),
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        mock_home = mock_path.home.return_value
+        no_file = type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: "/fake/.gitconfig"}
+        )()
+        mock_home.__truediv__ = lambda self, key: no_file
+
+        await tool.execute(
+            "containers",
+            {
+                "operation": "create",
+                "name": "test-chown",
+                "forward_git": False,
+                "forward_gh": False,
+            },
+        )
+
+    assert any("chown" in cmd and "/workspace" in cmd for cmd in exec_commands)
+
+
+@pytest.mark.asyncio
+async def test_exec_uses_exec_user(tool: ContainersTool):
+    """docker exec includes --user from metadata."""
+    # Pre-save metadata with exec_user
+    tool.store.save("test-exec", {"exec_user": "1000:1000"})
+
+    captured_args: list[tuple[str, ...]] = []
+
+    async def _capture(*args: str, **kwargs: object) -> CommandResult:
+        captured_args.append(args)
+        return CommandResult(0, "output\n", "")
+
+    tool.runtime.run = _capture  # type: ignore[assignment]
+
+    await tool.execute(
+        "containers",
+        {
+            "operation": "exec",
+            "container": "test-exec",
+            "command": "ls -la",
+        },
+    )
+
+    exec_call = captured_args[0]
+    assert "--user" in exec_call
+    user_idx = exec_call.index("--user")
+    assert exec_call[user_idx + 1] == "1000:1000"
+
+
+@pytest.mark.asyncio
+async def test_exec_as_root_skips_user(tool: ContainersTool):
+    """as_root=True runs without --user."""
+    tool.store.save("test-exec-root", {"exec_user": "1000:1000"})
+
+    captured_args: list[tuple[str, ...]] = []
+
+    async def _capture(*args: str, **kwargs: object) -> CommandResult:
+        captured_args.append(args)
+        return CommandResult(0, "output\n", "")
+
+    tool.runtime.run = _capture  # type: ignore[assignment]
+
+    await tool.execute(
+        "containers",
+        {
+            "operation": "exec",
+            "container": "test-exec-root",
+            "command": "apt-get update",
+            "as_root": True,
+        },
+    )
+
+    exec_call = captured_args[0]
+    assert "--user" not in exec_call
+
+
+@pytest.mark.asyncio
+async def test_exec_no_mounts_no_user(tool: ContainersTool):
+    """mount_cwd=False with no mounts means no exec_user, so exec has no --user."""
+    # Metadata without exec_user (simulates container created without mounts)
+    tool.store.save("test-nomount", {"exec_user": None})
+
+    captured_args: list[tuple[str, ...]] = []
+
+    async def _capture(*args: str, **kwargs: object) -> CommandResult:
+        captured_args.append(args)
+        return CommandResult(0, "output\n", "")
+
+    tool.runtime.run = _capture  # type: ignore[assignment]
+
+    await tool.execute(
+        "containers",
+        {
+            "operation": "exec",
+            "container": "test-nomount",
+            "command": "whoami",
+        },
+    )
+
+    exec_call = captured_args[0]
+    assert "--user" not in exec_call
+
+
+@pytest.mark.asyncio
+async def test_exec_interactive_hint_includes_user(tool: ContainersTool):
+    """Interactive hint includes --user when exec_user is set."""
+    tool.store.save("test-hint", {"exec_user": "1000:1000"})
+
+    async def _mock_run(*args: str, **kwargs: object) -> CommandResult:
+        # test -x /bin/bash succeeds
+        return CommandResult(0, "", "")
+
+    tool.runtime.run = _mock_run  # type: ignore[assignment]
+
+    result = await tool.execute(
+        "containers",
+        {
+            "operation": "exec_interactive_hint",
+            "container": "test-hint",
+        },
+    )
+
+    assert "--user 1000:1000" in result["command"]
+
+
+@pytest.mark.asyncio
+async def test_exec_background_uses_exec_user(tool: ContainersTool):
+    """Background exec respects mapped user."""
+    tool.store.save("test-bg", {"exec_user": "1000:1000"})
+
+    captured_args: list[tuple[str, ...]] = []
+
+    async def _capture(*args: str, **kwargs: object) -> CommandResult:
+        captured_args.append(args)
+        return CommandResult(0, "12345\n", "")
+
+    tool.runtime.run = _capture  # type: ignore[assignment]
+
+    await tool.execute(
+        "containers",
+        {
+            "operation": "exec_background",
+            "container": "test-bg",
+            "command": "long-running-cmd",
+        },
+    )
+
+    exec_call = captured_args[0]
+    assert "--user" in exec_call
+    user_idx = exec_call.index("--user")
+    assert exec_call[user_idx + 1] == "1000:1000"
+
+
+@pytest.mark.asyncio
+async def test_create_no_cap_drop_all(tool: ContainersTool):
+    """docker run args do NOT contain --cap-drop=ALL."""
+    tool._preflight_passed = True
+    captured_args: list[tuple[str, ...]] = []
+
+    async def _capture(*args: str, **kwargs: object) -> CommandResult:
+        captured_args.append(args)
+        if args and args[0] == "run":
+            return CommandResult(0, "abc123def456\n", "")
+        return CommandResult(0, "/root\n", "")
+
+    tool.runtime.run = _capture  # type: ignore[assignment]
+    tool.provisioner.runtime.run = _capture  # type: ignore[assignment]
+
+    with (
+        patch("amplifier_module_tool_containers.provisioner.shutil.which", return_value=None),
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        mock_home = mock_path.home.return_value
+        no_file = type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: "/fake/.gitconfig"}
+        )()
+        mock_home.__truediv__ = lambda self, key: no_file
+
+        await tool.execute(
+            "containers",
+            {
+                "operation": "create",
+                "name": "test-no-cap",
+                "forward_git": False,
+                "forward_gh": False,
+            },
+        )
+
+    run_call = next(c for c in captured_args if c and c[0] == "run")
+    assert "--cap-drop=ALL" not in run_call
+    # But security-opt should still be present
+    assert "--security-opt=no-new-privileges" in run_call
+
+
+def test_as_root_in_schema(tool: ContainersTool):
+    """as_root is in the tool input schema."""
+    defs = tool.tool_definitions
+    schema = defs[0]["input_schema"]
+    assert "as_root" in schema["properties"]
+    assert schema["properties"]["as_root"]["type"] == "boolean"

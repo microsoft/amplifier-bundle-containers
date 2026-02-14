@@ -229,23 +229,20 @@ async def test_provision_git_uses_dynamic_home():
 
 
 # ---------------------------------------------------------------------------
-# UID/GID mapping in _op_create
+# Two-phase user model: exec_user in metadata (not --user on docker run)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_uid_gid_mapping_default():
-    """When mount_cwd=True, --user flag is added with host UID:GID."""
-    from amplifier_module_tool_containers import ContainersTool
+async def test_uid_gid_mapping_default(tmp_path):
+    """When mount_cwd=True, exec_user is stored in metadata with host UID:GID."""
+    from amplifier_module_tool_containers import ContainersTool, MetadataStore
 
     tool = ContainersTool()
     tool._preflight_passed = True
-
-    captured_args: list[str] = []
+    tool.store = MetadataStore(base_dir=tmp_path)
 
     async def _capture(*args: str, **kwargs: object) -> CommandResult:
-        captured_args.extend(args)
-        # Return container ID for the "run" call, empty for provisioning
         if args and args[0] == "run":
             return CommandResult(0, "abc123def456\n", "")
         return CommandResult(0, "/root\n", "")
@@ -267,23 +264,21 @@ async def test_uid_gid_mapping_default():
         },
     )
 
-    assert "--user" in captured_args
-    idx = captured_args.index("--user")
-    assert captured_args[idx + 1] == f"{uid}:{gid}"
+    metadata = tool.store.load("test-uid")
+    assert metadata is not None
+    assert metadata["exec_user"] == f"{uid}:{gid}"
 
 
 @pytest.mark.asyncio
-async def test_uid_gid_mapping_no_mount():
-    """When mount_cwd=False and no mounts, no --user flag added."""
-    from amplifier_module_tool_containers import ContainersTool
+async def test_uid_gid_mapping_no_mount(tmp_path):
+    """When mount_cwd=False and no mounts, no exec_user in metadata."""
+    from amplifier_module_tool_containers import ContainersTool, MetadataStore
 
     tool = ContainersTool()
     tool._preflight_passed = True
-
-    captured_args: list[str] = []
+    tool.store = MetadataStore(base_dir=tmp_path)
 
     async def _capture(*args: str, **kwargs: object) -> CommandResult:
-        captured_args.extend(args)
         if args and args[0] == "run":
             return CommandResult(0, "abc123def456\n", "")
         return CommandResult(0, "/root\n", "")
@@ -303,21 +298,21 @@ async def test_uid_gid_mapping_no_mount():
         },
     )
 
-    assert "--user" not in captured_args
+    metadata = tool.store.load("test-nouid")
+    assert metadata is not None
+    assert metadata["exec_user"] is None
 
 
 @pytest.mark.asyncio
-async def test_uid_gid_mapping_explicit_root():
-    """user='root' does NOT add --user flag."""
-    from amplifier_module_tool_containers import ContainersTool
+async def test_uid_gid_mapping_explicit_root(tmp_path):
+    """user='root' results in no exec_user in metadata."""
+    from amplifier_module_tool_containers import ContainersTool, MetadataStore
 
     tool = ContainersTool()
     tool._preflight_passed = True
-
-    captured_args: list[str] = []
+    tool.store = MetadataStore(base_dir=tmp_path)
 
     async def _capture(*args: str, **kwargs: object) -> CommandResult:
-        captured_args.extend(args)
         if args and args[0] == "run":
             return CommandResult(0, "abc123def456\n", "")
         return CommandResult(0, "/root\n", "")
@@ -337,21 +332,21 @@ async def test_uid_gid_mapping_explicit_root():
         },
     )
 
-    assert "--user" not in captured_args
+    metadata = tool.store.load("test-root")
+    assert metadata is not None
+    assert metadata["exec_user"] is None
 
 
 @pytest.mark.asyncio
-async def test_uid_gid_mapping_explicit_user():
-    """user='1000:1000' is used as-is."""
-    from amplifier_module_tool_containers import ContainersTool
+async def test_uid_gid_mapping_explicit_user(tmp_path):
+    """user='1000:1000' is stored as exec_user in metadata."""
+    from amplifier_module_tool_containers import ContainersTool, MetadataStore
 
     tool = ContainersTool()
     tool._preflight_passed = True
-
-    captured_args: list[str] = []
+    tool.store = MetadataStore(base_dir=tmp_path)
 
     async def _capture(*args: str, **kwargs: object) -> CommandResult:
-        captured_args.extend(args)
         if args and args[0] == "run":
             return CommandResult(0, "abc123def456\n", "")
         return CommandResult(0, "/root\n", "")
@@ -371,9 +366,9 @@ async def test_uid_gid_mapping_explicit_user():
         },
     )
 
-    assert "--user" in captured_args
-    idx = captured_args.index("--user")
-    assert captured_args[idx + 1] == "1000:1000"
+    metadata = tool.store.load("test-explicit")
+    assert metadata is not None
+    assert metadata["exec_user"] == "1000:1000"
 
 
 # ---------------------------------------------------------------------------
