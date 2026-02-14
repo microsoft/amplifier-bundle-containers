@@ -108,10 +108,7 @@ class ContainerSafetyHooks:
             reasons.append("Destroying ALL managed containers")
 
         # Check: Container limit
-        if (
-            operation == "create"
-            and len(self._session_containers) >= self.max_containers
-        ):
+        if operation == "create" and len(self._session_containers) >= self.max_containers:
             return {
                 "action": "deny",
                 "reason": (

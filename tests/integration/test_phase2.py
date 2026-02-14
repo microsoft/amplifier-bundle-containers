@@ -30,9 +30,7 @@ import pytest
 import pytest_asyncio
 
 # Add module to path
-sys.path.insert(
-    0, os.path.join(os.path.dirname(__file__), "../../modules/tool-containers")
-)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../modules/tool-containers"))
 
 from amplifier_module_tool_containers import ContainersTool, MetadataStore
 
@@ -155,7 +153,7 @@ class TestUIDMapping:
             assert result.get("success"), f"Create failed: {result}"
 
             # Create a file inside the mounted workspace
-            exec_result = await tool.execute(
+            await tool.execute(
                 "containers",
                 {
                     "operation": "exec",
@@ -167,12 +165,8 @@ class TestUIDMapping:
             # Check ownership on the host
             if host_file.exists():
                 stat = host_file.stat()
-                assert stat.st_uid == os.getuid(), (
-                    f"Expected UID {os.getuid()}, got {stat.st_uid}"
-                )
-                assert stat.st_gid == os.getgid(), (
-                    f"Expected GID {os.getgid()}, got {stat.st_gid}"
-                )
+                assert stat.st_uid == os.getuid(), f"Expected UID {os.getuid()}, got {stat.st_uid}"
+                assert stat.st_gid == os.getgid(), f"Expected GID {os.getgid()}, got {stat.st_gid}"
             # Note: if file doesn't exist, the touch may have failed due to
             # permissions with the UID mapping — that's still a valid test signal
         finally:

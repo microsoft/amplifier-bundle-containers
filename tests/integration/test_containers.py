@@ -24,9 +24,7 @@ import pytest
 import pytest_asyncio
 
 # Add module to path
-sys.path.insert(
-    0, os.path.join(os.path.dirname(__file__), "../../modules/tool-containers")
-)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../modules/tool-containers"))
 
 from amplifier_module_tool_containers import ContainersTool, MetadataStore
 
@@ -157,9 +155,7 @@ class TestPreflight:
 
         # Every check should have passed
         for check in result["checks"]:
-            assert check["passed"] is True, (
-                f"Check '{check['name']}' failed: {check['detail']}"
-            )
+            assert check["passed"] is True, f"Check '{check['name']}' failed: {check['detail']}"
 
 
 class TestContainerLifecycle:
@@ -196,9 +192,7 @@ class TestContainerLifecycle:
                 "{{.Names}}",
                 timeout=10,
             )
-            assert name in verify.stdout, (
-                f"Container {name} not found in docker ps output"
-            )
+            assert name in verify.stdout, f"Container {name} not found in docker ps output"
 
             # Destroy
             destroy_result = await tool.execute(
@@ -221,9 +215,7 @@ class TestContainerLifecycle:
                 "{{.Names}}",
                 timeout=10,
             )
-            assert name not in verify_gone.stdout, (
-                f"Container {name} still exists after destroy"
-            )
+            assert name not in verify_gone.stdout, f"Container {name} still exists after destroy"
         finally:
             # Safety cleanup
             await _force_destroy(tool, name)
@@ -462,17 +454,13 @@ class TestMetadata:
                 },
             )
             assert destroy_result.get("success")
-            assert not meta_dir.exists(), (
-                f"Metadata dir {meta_dir} should be removed after destroy"
-            )
+            assert not meta_dir.exists(), f"Metadata dir {meta_dir} should be removed after destroy"
         finally:
             await _force_destroy(tool, name)
 
 
 class TestCopyInOut:
-    async def test_copy_in_and_out(
-        self, tool: ContainersTool, container: str, tmp_path
-    ):
+    async def test_copy_in_and_out(self, tool: ContainersTool, container: str, tmp_path):
         """Copy a file into the container and back out, verify contents."""
         # Write a test file on the host
         test_content = f"integration-test-{uuid.uuid4().hex}"
