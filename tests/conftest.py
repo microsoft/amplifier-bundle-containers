@@ -37,8 +37,11 @@ def tool(tmp_path):
     """ContainersTool with a tmp_path-backed MetadataStore and mocked runtime."""
     t = ContainersTool()
     t.store = MetadataStore(base_dir=tmp_path)
-    t.runtime = ContainerRuntime()
-    t.runtime._runtime = "docker"
+    runtime = ContainerRuntime()
+    runtime._runtime = "docker"
+    t.runtime = runtime
+    # Keep provisioner in sync with the replaced runtime
+    t.provisioner.runtime = runtime
     return t
 
 

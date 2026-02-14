@@ -8,7 +8,6 @@ defaults, and container lifecycle management.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import shutil
@@ -18,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .images import resolve_purpose
-from .provisioner import resolve_env_passthrough
+from .provisioner import ContainerProvisioner, resolve_env_passthrough
 from .runtime import ContainerRuntime
 
 __amplifier_module_type__ = "tool"
@@ -110,6 +109,7 @@ class ContainersTool:
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         self.config = config or {}
         self.runtime = ContainerRuntime()
+        self.provisioner = ContainerProvisioner(self.runtime)
         self.store = MetadataStore()
         self._preflight_passed = False
 
@@ -206,6 +206,10 @@ class ContainersTool:
                         "gpu": {"type": "boolean", "default": False},
                         "network": {"type": "string", "default": "bridge"},
                         "persistent": {"type": "boolean", "default": False},
+                        "user": {
+                            "type": "string",
+                            "description": "Container user (default: host UID:GID for mounted volumes, 'root' for root access)",
+                        },
                         "force": {"type": "boolean", "default": False},
                         "confirm": {"type": "boolean", "default": False},
                         "health_check": {"type": "boolean", "default": False},
@@ -276,9 +280,7 @@ class ContainersTool:
                 "passed": daemon_ok,
                 "detail": "Daemon responding" if daemon_ok else "Daemon not responding",
                 "guidance": (
-                    None
-                    if daemon_ok
-                    else f"Start the daemon: sudo systemctl start {runtime}"
+                    None if daemon_ok else f"Start the daemon: sudo systemctl start {runtime}"
                 ),
             }
         )
@@ -290,9 +292,7 @@ class ContainersTool:
                 {
                     "name": "user_permissions",
                     "passed": perms_ok,
-                    "detail": "User can access runtime"
-                    if perms_ok
-                    else "Permission denied",
+                    "detail": "User can access runtime" if perms_ok else "Permission denied",
                     "guidance": (
                         None
                         if perms_ok
@@ -329,9 +329,7 @@ class ContainersTool:
                     "passed": disk_passed,
                     "detail": disk_detail,
                     "guidance": (
-                        None
-                        if disk_passed
-                        else f"Free disk space or run: {runtime} system prune"
+                        None if disk_passed else f"Free disk space or run: {runtime} system prune"
                     ),
                 }
             )
@@ -408,11 +406,12 @@ class ContainersTool:
             mode = mount.get("mode", "rw")
             args.extend(["-v", f"{mount['host']}:{mount['container']}:{mode}"])
 
-        # SSH key mount (must be at creation time)
+        # SSH key mount (must be at creation time) — staged to /tmp/.host-ssh
+        # so the provisioner can copy with correct ownership into container $HOME
         if inp.get("forward_ssh", False):
             ssh_dir = Path.home() / ".ssh"
             if ssh_dir.exists():
-                args.extend(["-v", f"{ssh_dir}:/root/.ssh:ro"])
+                args.extend(["-v", f"{ssh_dir}:/tmp/.host-ssh:ro"])
 
         # Ports
         for port in inp.get("ports", []):
@@ -427,6 +426,16 @@ class ContainersTool:
         )
         for key, value in env_vars.items():
             args.extend(["-e", f"{key}={value}"])
+
+        # Default to host UID:GID for proper file ownership on mounted volumes
+        user_flag = inp.get("user")
+        if user_flag is None and (inp.get("mount_cwd", True) or inp.get("mounts")):
+            uid = os.getuid()
+            gid = os.getgid()
+            user_flag = f"{uid}:{gid}"
+
+        if user_flag and user_flag != "root":
+            args.extend(["--user", user_flag])
 
         # Labels
         now = datetime.now(timezone.utc).isoformat()
@@ -458,15 +467,15 @@ class ContainersTool:
 
         # Provision: git config
         if inp.get("forward_git", True):
-            await self._provision_git(name)
+            await self.provisioner.provision_git(name)
 
         # Provision: GH auth
         if inp.get("forward_gh", True):
-            await self._provision_gh_auth(name)
+            await self.provisioner.provision_gh_auth(name)
 
         # Provision: SSH permissions fix
         if inp.get("forward_ssh", False):
-            await self._fix_ssh_permissions(name)
+            await self.provisioner.fix_ssh_permissions(name)
 
         # Provision: dotfiles
         if not inp.get("dotfiles_skip", False):
@@ -475,7 +484,7 @@ class ContainersTool:
                 self.config.get("dotfiles", {}).get("repo"),
             )
             if dotfiles_repo:
-                await self._provision_dotfiles(
+                await self.provisioner.provision_dotfiles(
                     name,
                     repo=dotfiles_repo,
                     script=inp.get("dotfiles_script"),
@@ -483,13 +492,11 @@ class ContainersTool:
                     target=inp.get("dotfiles_target", "~/.dotfiles"),
                 )
             elif inp.get("dotfiles_inline"):
-                await self._provision_dotfiles_inline(name, inp["dotfiles_inline"])
+                await self.provisioner.provision_dotfiles_inline(name, inp["dotfiles_inline"])
 
         # Run setup commands
         for cmd in inp.get("setup_commands", []):
-            cmd_result = await self.runtime.run(
-                "exec", name, "/bin/sh", "-c", cmd, timeout=300
-            )
+            cmd_result = await self.runtime.run("exec", name, "/bin/sh", "-c", cmd, timeout=300)
             if cmd_result.returncode != 0:
                 # Log but don't fail — setup commands are best-effort
                 pass
@@ -556,9 +563,7 @@ class ContainersTool:
         runtime = await self.runtime.detect()
         # Detect best available shell
         for shell in ("/bin/bash", "/bin/zsh", "/bin/sh"):
-            result = await self.runtime.run(
-                "exec", container, "test", "-x", shell, timeout=5
-            )
+            result = await self.runtime.run("exec", container, "test", "-x", shell, timeout=5)
             if result.returncode == 0:
                 return {
                     "command": f"{runtime} exec -it {container} {shell}",
@@ -603,9 +608,7 @@ class ContainersTool:
         container = inp.get("container", "")
         if not container:
             return {"error": "'container' is required"}
-        result = await self.runtime.run(
-            "inspect", "--format", "json", container, timeout=10
-        )
+        result = await self.runtime.run("inspect", "--format", "json", container, timeout=10)
         if result.returncode != 0:
             return {"error": f"Container not found: {container}"}
         try:
@@ -690,9 +693,7 @@ class ContainersTool:
             "success": result.returncode == 0,
             "snapshot": snapshot_name,
             "image": image_tag,
-            "detail": result.stderr.strip()
-            if result.returncode != 0
-            else "Snapshot created",
+            "detail": result.stderr.strip() if result.returncode != 0 else "Snapshot created",
         }
 
     async def _op_restore(self, inp: dict[str, Any]) -> dict[str, Any]:
@@ -719,9 +720,7 @@ class ContainersTool:
         return {
             "success": result.returncode == 0,
             "network": name,
-            "detail": result.stderr.strip()
-            if result.returncode != 0
-            else "Network created",
+            "detail": result.stderr.strip() if result.returncode != 0 else "Network created",
         }
 
     async def _op_destroy_network(self, inp: dict[str, Any]) -> dict[str, Any]:
@@ -732,187 +731,8 @@ class ContainersTool:
         return {
             "success": result.returncode == 0,
             "network": name,
-            "detail": result.stderr.strip()
-            if result.returncode != 0
-            else "Network removed",
+            "detail": result.stderr.strip() if result.returncode != 0 else "Network removed",
         }
-
-    # -- Provisioning helpers ------------------------------------------------
-
-    async def _provision_git(self, container: str) -> None:
-        """Copy git configuration into the container."""
-        home = Path.home()
-        for src_name, dst_path in [
-            (".gitconfig", "/root/.gitconfig"),
-            (".gitconfig.local", "/root/.gitconfig.local"),
-            (".ssh/known_hosts", "/root/.ssh/known_hosts"),
-        ]:
-            src = home / src_name
-            if src.exists():
-                # Ensure target directory exists
-                dst_dir = str(Path(dst_path).parent)
-                await self.runtime.run(
-                    "exec", container, "mkdir", "-p", dst_dir, timeout=5
-                )
-                await self.runtime.run(
-                    "cp", str(src), f"{container}:{dst_path}", timeout=10
-                )
-
-    async def _provision_gh_auth(self, container: str) -> None:
-        """Forward GitHub CLI authentication into the container."""
-        gh_path = shutil.which("gh")
-        if not gh_path:
-            return
-        # Extract token from host gh cli
-        proc = await asyncio.create_subprocess_exec(
-            "gh",
-            "auth",
-            "token",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        if proc.returncode != 0:
-            return
-        token = stdout.decode().strip()
-        if not token:
-            return
-        # Inject as env vars
-        env_script = (
-            f'echo "export GH_TOKEN={token}" >> /root/.bashrc && '
-            f'echo "export GITHUB_TOKEN={token}" >> /root/.bashrc'
-        )
-        await self.runtime.run(
-            "exec", container, "/bin/sh", "-c", env_script, timeout=5
-        )
-        # If gh is in the container, do full auth login
-        gh_check = await self.runtime.run("exec", container, "which", "gh", timeout=5)
-        if gh_check.returncode == 0:
-            await self.runtime.run(
-                "exec",
-                container,
-                "/bin/sh",
-                "-c",
-                f'echo "{token}" | gh auth login --with-token',
-                timeout=15,
-            )
-
-    async def _fix_ssh_permissions(self, container: str) -> None:
-        """Fix SSH key permissions after bind mount."""
-        cmds = [
-            "chmod 700 /root/.ssh 2>/dev/null || true",
-            "chmod 600 /root/.ssh/id_* 2>/dev/null || true",
-            "chmod 644 /root/.ssh/*.pub 2>/dev/null || true",
-            "chmod 644 /root/.ssh/known_hosts 2>/dev/null || true",
-            "chmod 644 /root/.ssh/config 2>/dev/null || true",
-        ]
-        for cmd in cmds:
-            await self.runtime.run("exec", container, "/bin/sh", "-c", cmd, timeout=5)
-
-    async def _provision_dotfiles(
-        self,
-        container: str,
-        repo: str,
-        script: str | None = None,
-        branch: str | None = None,
-        target: str = "~/.dotfiles",
-    ) -> None:
-        """Clone and apply dotfiles from a git repo."""
-        # Clone
-        clone_cmd = "git clone --depth=1"
-        if branch:
-            clone_cmd += f" --branch {branch}"
-        clone_cmd += f" {repo} {target}"
-        result = await self.runtime.run(
-            "exec", container, "/bin/sh", "-c", clone_cmd, timeout=60
-        )
-        if result.returncode != 0:
-            return  # Clone failed, skip silently
-
-        # Find and run install script
-        script_candidates = (
-            [script]
-            if script
-            else ["install.sh", "setup.sh", "bootstrap.sh", "script/setup"]
-        )
-        for candidate in script_candidates:
-            check = await self.runtime.run(
-                "exec",
-                container,
-                "test",
-                "-f",
-                f"{target}/{candidate}",
-                timeout=5,
-            )
-            if check.returncode == 0:
-                await self.runtime.run(
-                    "exec",
-                    container,
-                    "/bin/sh",
-                    "-c",
-                    f"cd {target} && chmod +x {candidate} && ./{candidate}",
-                    timeout=300,
-                )
-                return
-
-        # Check for Makefile
-        make_check = await self.runtime.run(
-            "exec",
-            container,
-            "test",
-            "-f",
-            f"{target}/Makefile",
-            timeout=5,
-        )
-        if make_check.returncode == 0:
-            await self.runtime.run(
-                "exec",
-                container,
-                "/bin/sh",
-                "-c",
-                f"cd {target} && make",
-                timeout=300,
-            )
-            return
-
-        # Fallback: smart symlink common dotfiles
-        common = [
-            ".bashrc",
-            ".bash_profile",
-            ".bash_aliases",
-            ".zshrc",
-            ".zprofile",
-            ".gitconfig",
-            ".gitignore_global",
-            ".vimrc",
-            ".tmux.conf",
-            ".inputrc",
-            ".editorconfig",
-        ]
-        for dotfile in common:
-            await self.runtime.run(
-                "exec",
-                container,
-                "/bin/sh",
-                "-c",
-                f"test -f {target}/{dotfile} && ln -sf {target}/{dotfile} ~/{dotfile}",
-                timeout=5,
-            )
-
-    async def _provision_dotfiles_inline(
-        self, container: str, files: dict[str, str]
-    ) -> None:
-        """Write inline dotfiles content into the container."""
-        for path, content in files.items():
-            escaped = content.replace("'", "'\\''")
-            await self.runtime.run(
-                "exec",
-                container,
-                "/bin/sh",
-                "-c",
-                f"mkdir -p $(dirname ~/{path}) && cat > ~/{path} << 'AMPLIFIER_DOTFILES_EOF'\n{escaped}\nAMPLIFIER_DOTFILES_EOF",
-                timeout=10,
-            )
 
 
 # ---------------------------------------------------------------------------
