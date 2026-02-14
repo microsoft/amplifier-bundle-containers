@@ -1128,3 +1128,98 @@ async def test_amplifier_settings_provisioned(tool: ContainersTool):
     assert "provisioning_report" in result
     step_names = [e["name"] for e in result["provisioning_report"]]
     assert "amplifier_settings" in step_names
+
+
+# ---------------------------------------------------------------------------
+# GPU preflight
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_gpu_preflight_nvidia_available(tool: ContainersTool):
+    """GPU check reports nvidia available when runtime has it."""
+
+    async def _mock_run(*args: str, **kwargs: object) -> CommandResult:
+        if "info" in args and "--format" in args:
+            return CommandResult(
+                returncode=0,
+                stdout="map[io.containerd.runc.v2:{} nvidia:{}]",
+                stderr="",
+            )
+        return CommandResult(returncode=0, stdout="", stderr="")
+
+    tool.runtime.run = _mock_run  # type: ignore[assignment]
+    tool.runtime._runtime = "docker"
+
+    result = await tool.execute("containers", {"operation": "preflight"})
+    gpu_check = next(c for c in result["checks"] if c["name"] == "gpu_runtime")
+    assert gpu_check["passed"] is True
+    assert "NVIDIA runtime available" in gpu_check["detail"]
+
+
+@pytest.mark.asyncio
+async def test_gpu_preflight_nvidia_unavailable(tool: ContainersTool):
+    """GPU check reports unavailable but ready is still True."""
+
+    async def _mock_run(*args: str, **kwargs: object) -> CommandResult:
+        if "info" in args and "--format" in args:
+            return CommandResult(
+                returncode=0,
+                stdout="map[io.containerd.runc.v2:{}]",
+                stderr="",
+            )
+        return CommandResult(returncode=0, stdout="", stderr="")
+
+    tool.runtime.run = _mock_run  # type: ignore[assignment]
+    tool.runtime._runtime = "docker"
+
+    result = await tool.execute("containers", {"operation": "preflight"})
+    assert result["ready"] is True  # CRITICAL: GPU absence doesn't break preflight
+    gpu_check = next(c for c in result["checks"] if c["name"] == "gpu_runtime")
+    assert gpu_check["passed"] is True
+    assert "not detected" in gpu_check["detail"]
+    assert gpu_check["guidance"] is not None
+
+
+@pytest.mark.asyncio
+async def test_gpu_preflight_podman_skipped(tool: ContainersTool):
+    """GPU check on Podman reports not supported."""
+
+    async def _mock_run(*args: str, **kwargs: object) -> CommandResult:
+        return CommandResult(returncode=0, stdout="", stderr="")
+
+    tool.runtime.run = _mock_run  # type: ignore[assignment]
+    tool.runtime._runtime = "podman"
+
+    result = await tool.execute("containers", {"operation": "preflight"})
+    gpu_check = next(c for c in result["checks"] if c["name"] == "gpu_runtime")
+    assert gpu_check["passed"] is True
+    assert "not supported for Podman" in gpu_check["detail"]
+
+
+@pytest.mark.asyncio
+async def test_gpu_check_does_not_affect_ready(tool: ContainersTool):
+    """ready=True even when GPU is unavailable — GPU is informational only."""
+
+    async def _mock_run(*args: str, **kwargs: object) -> CommandResult:
+        if "info" in args and "--format" in args:
+            return CommandResult(
+                returncode=0,
+                stdout="map[io.containerd.runc.v2:{}]",
+                stderr="",
+            )
+        return CommandResult(returncode=0, stdout="", stderr="")
+
+    tool.runtime.run = _mock_run  # type: ignore[assignment]
+    tool.runtime._runtime = "docker"
+
+    result = await tool.execute("containers", {"operation": "preflight"})
+    assert result["ready"] is True
+
+
+def test_gpu_flag_in_create_schema():
+    """Regression guard: gpu parameter exists in tool schema."""
+    t = ContainersTool()
+    schema = t.tool_definitions[0]["input_schema"]
+    assert "gpu" in schema["properties"]
+    assert schema["properties"]["gpu"]["type"] == "boolean"

@@ -414,6 +414,37 @@ class ContainersTool:
                 }
             )
 
+        # 5. GPU runtime (informational — does not affect ready status)
+        if runtime == "podman":
+            checks.append(
+                {
+                    "name": "gpu_runtime",
+                    "passed": True,  # Always True — GPU is optional
+                    "detail": "GPU detection not supported for Podman",
+                    "guidance": None,
+                }
+            )
+        else:
+            gpu_info = await self.runtime.run("info", "--format", "{{.Runtimes}}", timeout=10)
+            if gpu_info.returncode == 0 and "nvidia" in gpu_info.stdout.lower():
+                checks.append(
+                    {
+                        "name": "gpu_runtime",
+                        "passed": True,
+                        "detail": "NVIDIA runtime available (GPU passthrough supported)",
+                        "guidance": None,
+                    }
+                )
+            else:
+                checks.append(
+                    {
+                        "name": "gpu_runtime",
+                        "passed": True,  # Always True — GPU is optional
+                        "detail": "NVIDIA runtime not detected (GPU passthrough unavailable)",
+                        "guidance": "Install nvidia-container-toolkit: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html",
+                    }
+                )
+
         all_passed = all(c["passed"] for c in checks)
         if all_passed:
             self._preflight_passed = True
