@@ -535,7 +535,9 @@ async def test_exec_poll_running(tool: ContainersTool):
     async def _mock_run(*args, **kwargs):
         nonlocal call_count
         call_count += 1
-        if call_count == 1:  # kill -0 check
+        if call_count == 1:  # cat exit file (not found yet)
+            return CommandResult(returncode=1, stdout="", stderr="")
+        elif call_count == 2:  # kill -0 check
             return CommandResult(returncode=0, stdout="running\n", stderr="")
         else:  # tail output
             return CommandResult(returncode=0, stdout="partial output\n", stderr="")
@@ -563,12 +565,10 @@ async def test_exec_poll_completed(tool: ContainersTool):
     async def _mock_run(*args, **kwargs):
         nonlocal call_count
         call_count += 1
-        if call_count == 1:  # kill -0 check
-            return CommandResult(returncode=0, stdout="done\n", stderr="")
-        elif call_count == 2:  # tail output
-            return CommandResult(returncode=0, stdout="all done\n", stderr="")
-        else:  # cat exit code
+        if call_count == 1:  # cat exit file (job completed, has exit code)
             return CommandResult(returncode=0, stdout="0\n", stderr="")
+        else:  # tail output
+            return CommandResult(returncode=0, stdout="all done\n", stderr="")
 
     tool.runtime.run = _mock_run
 

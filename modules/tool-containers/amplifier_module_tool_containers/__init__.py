@@ -911,16 +911,35 @@ class ContainersTool:
         if not container or not job_id:
             return {"error": "Both 'container' and 'job_id' are required"}
 
-        # Check if process is still running
-        pid_check = await self.runtime.run(
+        # Check if exit file exists first (definitive completion signal).
+        # We check this BEFORE kill -0 because PIDs can be recycled in
+        # minimal containers, causing kill -0 to succeed on a reused PID.
+        ec = await self.runtime.run(
             "exec",
             container,
             "/bin/sh",
             "-c",
-            f"kill -0 $(cat /tmp/amp-job-{job_id}.pid 2>/dev/null) 2>/dev/null && echo running || echo done",
+            f"cat /tmp/amp-job-{job_id}.exit 2>/dev/null",
             timeout=5,
         )
-        running = "running" in pid_check.stdout
+        ec_str = ec.stdout.strip()
+
+        exit_code = None
+        if ec_str.isdigit():
+            # Exit file exists → job is done regardless of PID state
+            running = False
+            exit_code = int(ec_str)
+        else:
+            # No exit file yet → check if process is still alive
+            pid_check = await self.runtime.run(
+                "exec",
+                container,
+                "/bin/sh",
+                "-c",
+                f"kill -0 $(cat /tmp/amp-job-{job_id}.pid 2>/dev/null) 2>/dev/null && echo running || echo done",
+                timeout=5,
+            )
+            running = "running" in pid_check.stdout
 
         # Get output (tail last 100 lines)
         output = await self.runtime.run(
@@ -931,21 +950,6 @@ class ContainersTool:
             f"tail -100 /tmp/amp-job-{job_id}.out 2>/dev/null",
             timeout=5,
         )
-
-        # Get exit code if done
-        exit_code = None
-        if not running:
-            ec = await self.runtime.run(
-                "exec",
-                container,
-                "/bin/sh",
-                "-c",
-                f"cat /tmp/amp-job-{job_id}.exit 2>/dev/null",
-                timeout=5,
-            )
-            ec_str = ec.stdout.strip()
-            if ec_str.isdigit():
-                exit_code = int(ec_str)
 
         return {
             "job_id": job_id,
