@@ -1213,8 +1213,7 @@ async def _op_exec_cancel(self, inp: dict) -> dict:
 **What**: Move `--user` from `docker run` to `docker exec`. Container runs as root (setup works), exec commands run as mapped user (file ownership correct). Add `as_root` parameter for post-setup admin access.
 
 **Files to modify**:
-- `modules/tool-containers/amplifier_module_tool_containers/__init__.py` — `_op_create`, `_op_exec`, `_op_exec_background`, `_op_exec_poll`
-- `modules/tool-containers/amplifier_module_tool_containers/runtime.py` — Add `exec_user` support
+- `modules/tool-containers/amplifier_module_tool_containers/__init__.py` — `_op_create`, `_op_exec`, `_op_exec_background`
 - `modules/tool-containers/amplifier_module_tool_containers/provisioner.py` — Target user home for provisioning
 - `tests/unit/test_provisioner.py` — Update UID mapping tests
 - `tests/unit/test_tool.py` — Update exec tests
@@ -1231,6 +1230,8 @@ AFTER (Phase 3):
   docker exec container pip install X                    ← Root (as_root)
 ```
 
+**Security adjustment**: Remove `--cap-drop=ALL` from `_op_create`. Docker's default capability set (~14 capabilities) is sufficient security for ephemeral dev containers. The primary security control `--security-opt=no-new-privileges` is preserved. This change is required because `--cap-drop=ALL` prevents root from running `apt-get install`, `useradd`, and `chown` — all needed for the two-phase model.
+
 **Changes**:
 
 1. **Remove `--user` from `docker run` in `_op_create`**:
@@ -1244,6 +1245,7 @@ AFTER (Phase 3):
          exec_user = inp.get("user")
      ```
    - Store `exec_user` in metadata.json
+   - Also remove `"--cap-drop=ALL"` from the security hardening args (keep `--security-opt=no-new-privileges`, `--memory`, `--pids-limit`)
 
 2. **Create user inside container during setup** (after container starts, before other setup):
    ```python
@@ -1280,15 +1282,25 @@ AFTER (Phase 3):
        metadata = self.store.load(container)
        exec_user = None if inp.get("as_root", False) else (metadata or {}).get("exec_user")
        
-       result = await self.runtime.run(
-           "exec", **({"exec_user": exec_user} if exec_user else {}),
-           container, "/bin/sh", "-c", inp["command"],
-           timeout=inp.get("timeout", 300),
-       )
+       # Build args with --user in the caller (see item 7)
+       exec_args = ["exec"]
+       if exec_user:
+           exec_args.extend(["--user", exec_user])
+       exec_args.extend([container, "/bin/sh", "-c", inp["command"]])
+       result = await self.runtime.run(*exec_args, timeout=inp.get("timeout", 300))
    ```
 
-7. **Modify `runtime.py` `run()` method** to accept optional `exec_user` parameter:
-   - When the first arg is "exec" and `exec_user` is provided, insert `--user {exec_user}` after "exec"
+7. **Build exec args with `--user` in the callers** (do NOT modify `runtime.py`):
+   Keep `runtime.run()` as a simple command runner. Instead, build the args list in `_op_exec` and `_op_exec_background`:
+   ```python
+   # In _op_exec:
+   exec_args = ["exec"]
+   if exec_user:
+       exec_args.extend(["--user", exec_user])
+   exec_args.extend([container, "/bin/sh", "-c", command])
+   result = await self.runtime.run(*exec_args, timeout=timeout)
+   ```
+   This avoids leaking Docker-exec semantics into the generic runtime abstraction.
 
 8. **Add `as_root` to tool schema**:
    ```python
@@ -1299,7 +1311,8 @@ AFTER (Phase 3):
    },
    ```
 
-9. **Update `_op_exec_background` and `_op_exec_poll`** to also respect exec_user from metadata (and as_root override).
+9. **Update `_op_exec_background` to use exec_user** (but NOT `_op_exec_poll` or `_op_exec_cancel`):
+   `exec_background` starts the actual command, so it should run as the mapped user by default (with `as_root` override). `exec_poll` and `exec_cancel` only read temp files and send signals — these work fine as root and don't need user mapping.
 
 10. **Update `_op_exec_interactive_hint`** to include the user flag:
     ```python
@@ -1308,7 +1321,18 @@ AFTER (Phase 3):
         return {"command": f"{runtime} exec -it --user {exec_user} {container} {shell}", ...}
     ```
 
-**Tests**:
+**Tests to rewrite** (these currently assert `--user` on docker run or mock create flows without useradd/chown):
+- `test_uid_gid_mapping_default` — Change: verify exec_user stored in metadata instead of --user in run args
+- `test_uid_gid_mapping_no_mount` — Change: verify no exec_user in metadata
+- `test_uid_gid_mapping_explicit_root` — Change: verify no exec_user in metadata
+- `test_uid_gid_mapping_explicit_user` — Change: verify exec_user="1000:1000" in metadata
+- `test_create_returns_provisioning_report` — Change: mock must handle useradd/chown exec calls
+- `test_provisioning_report_setup_command_partial` — Change: same mock update
+- `test_create_result_includes_cache_used` — Change: same mock update
+- `test_create_uses_cached_image` — Change: same mock update
+- `test_try_repo_adds_clone_to_setup` — Change: same mock update
+
+**New tests to write**:
 - `test_create_no_user_flag_on_run` — docker run args do NOT contain --user
 - `test_create_stores_exec_user_in_metadata` — metadata has exec_user field
 - `test_create_creates_hostuser` — useradd command is called during setup
@@ -1318,7 +1342,7 @@ AFTER (Phase 3):
 - `test_exec_no_mounts_no_user` — when mount_cwd=False, no exec_user, runs as root
 - `test_exec_interactive_hint_includes_user` — hint command includes --user when exec_user set
 - `test_exec_background_uses_exec_user` — background exec respects mapped user
-- Update existing UID mapping tests from Phase 2 (they test --user on docker run, need to test exec_user in metadata + --user on docker exec instead)
+- `test_create_no_cap_drop_all` — verify --cap-drop=ALL is NOT in docker run args
 - Integration: create with mount_cwd, touch file via exec (should be host-owned), install package via exec with as_root=True (should work)
 
 **Done when**: Container runs as root, setup commands (apt-get, pip) work. Exec commands create files with correct host ownership. `as_root=True` gives admin access. All security hardening preserved.
@@ -1339,9 +1363,21 @@ AFTER (Phase 3):
 2. Forward `~/.amplifier/settings.local.yaml` if it exists  
 3. Accept `amplifier_bundle` parameter — bundle name/URI to configure inside the container
 4. Accept `amplifier_version` parameter — pin amplifier version (default: latest)
-5. Set up proper PATH for `uv tool` binaries (`/root/.local/bin` since uv installs as root during setup)
+5. Install `uv` tools to a shared location accessible by both root and the mapped user:
+   ```python
+   # In amplifier profile setup_commands:
+   "pip install --quiet uv",
+   "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install amplifier",
+   ```
+   Using `UV_TOOL_BIN_DIR=/usr/local/bin` installs the amplifier binary to a location on the default PATH for all users, avoiding the `/root/.local/bin` accessibility issue when exec runs as a mapped user.
 
 **Additional create parameters**:
+```python
+"amplifier_bundle": {"type": "string", "description": "Bundle to configure inside the container"},
+"amplifier_version": {"type": "string", "description": "Amplifier version to install (default: latest)"},
+```
+
+**Add to tool schema** (alongside `as_root` from Task 3.1):
 ```python
 "amplifier_bundle": {"type": "string", "description": "Bundle to configure inside the container"},
 "amplifier_version": {"type": "string", "description": "Amplifier version to install (default: latest)"},
@@ -1399,7 +1435,6 @@ async def provision_amplifier_settings(self, container: str, target_home: str) -
 - `docs/PLAN.md` — Fix test counts
 
 **`container-awareness.md` updates**:
-- Add try-repo to purpose table
 - Add provisioning report mention ("create returns structured report — no need to investigate")
 - Add background exec operations (exec_background, exec_poll, exec_cancel) to quick reference
 - Add cache_clear to operations list
@@ -1426,7 +1461,6 @@ async def provision_amplifier_settings(self, container: str, target_home: str) -
 - Add Phase 2 features to feature list (try-repo, background exec, provisioning report, caching)
 - Add `as_root` to exec documentation
 - Update operations table
-- Update purpose table with try-repo
 
 **`DESIGN.md` updates**:
 - Phase 2 marked COMPLETE in implementation phases section
@@ -1434,6 +1468,12 @@ async def provision_amplifier_settings(self, container: str, target_home: str) -
 
 **`PLAN.md` updates**:
 - Fix test count section (currently says "Total target: ~80 tests", actual is 103+)
+
+**Pre-existing doc bugs to fix**:
+- `context/container-guide.md` line ~194: Claims "amplifier settings forwarded if they exist" — this isn't implemented yet (Task 3.2 will add it). Remove or mark as "after Task 3.2".
+- `context/container-guide.md` troubleshooting section: References `delete_snapshot` operation which doesn't exist. Change to `snapshot` (for creating) or remove.
+- `context/container-awareness.md`: Missing `user` parameter in convenience features table.
+- `context/container-guide.md` create parameter reference: Missing `user`, `cache_bust`, `repo_url` parameters.
 
 **Tests**: N/A (documentation)
 

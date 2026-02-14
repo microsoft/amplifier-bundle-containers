@@ -34,8 +34,6 @@ tools:
       security:
         allow_privileged: false
         allow_host_network: false
-        cap_drop:
-          - "ALL"
         memory_limit: "4g"
         pids_limit: 256
 

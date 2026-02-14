@@ -291,12 +291,13 @@ This avoids the 30-60 second `apt-get install` on every container creation while
 
 Container hardening:
 ```
---cap-drop=ALL
 --security-opt=no-new-privileges
 --memory=4g
 --pids-limit=256
 --network=bridge
 ```
+
+Docker's default capability set is used (not `--cap-drop=ALL`) to allow package installation, user creation, and file ownership changes inside the container. The primary security control is `no-new-privileges`, which prevents setuid privilege escalation.
 
 Never privileged by default. Never host network by default.
 
