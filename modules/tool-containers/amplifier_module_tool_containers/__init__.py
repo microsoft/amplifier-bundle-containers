@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .images import resolve_purpose
-from .provisioner import ContainerProvisioner, resolve_env_passthrough
+from .provisioner import ContainerProvisioner, ProvisioningStep, resolve_env_passthrough
 from .runtime import ContainerRuntime
 
 __amplifier_module_type__ = "tool"
@@ -465,41 +465,82 @@ class ContainersTool:
 
         container_id = result.stdout.strip()[:12]
 
-        # Provision: git config
+        # Collect provisioning report
+        report: list[ProvisioningStep] = []
+
+        # Env passthrough (already done via -e flags, just report it)
+        report.append(
+            ProvisioningStep("env_passthrough", "success", f"{len(env_vars)} variables injected")
+        )
+
+        # Git config
         if inp.get("forward_git", True):
-            await self.provisioner.provision_git(name)
+            report.append(await self.provisioner.provision_git(name))
+        else:
+            report.append(ProvisioningStep("forward_git", "skipped", "Not requested"))
 
-        # Provision: GH auth
+        # GH auth
         if inp.get("forward_gh", True):
-            await self.provisioner.provision_gh_auth(name)
+            report.append(await self.provisioner.provision_gh_auth(name))
+        else:
+            report.append(ProvisioningStep("forward_gh", "skipped", "Not requested"))
 
-        # Provision: SSH permissions fix
+        # SSH permissions
         if inp.get("forward_ssh", False):
-            await self.provisioner.fix_ssh_permissions(name)
+            report.append(await self.provisioner.fix_ssh_permissions(name))
+        else:
+            report.append(ProvisioningStep("forward_ssh", "skipped", "Not requested"))
 
-        # Provision: dotfiles
+        # Dotfiles
         if not inp.get("dotfiles_skip", False):
             dotfiles_repo = inp.get(
                 "dotfiles_repo",
                 self.config.get("dotfiles", {}).get("repo"),
             )
             if dotfiles_repo:
-                await self.provisioner.provision_dotfiles(
-                    name,
-                    repo=dotfiles_repo,
-                    script=inp.get("dotfiles_script"),
-                    branch=inp.get("dotfiles_branch"),
-                    target=inp.get("dotfiles_target", "~/.dotfiles"),
+                report.append(
+                    await self.provisioner.provision_dotfiles(
+                        name,
+                        repo=dotfiles_repo,
+                        script=inp.get("dotfiles_script"),
+                        branch=inp.get("dotfiles_branch"),
+                        target=inp.get("dotfiles_target", "~/.dotfiles"),
+                    )
                 )
             elif inp.get("dotfiles_inline"):
-                await self.provisioner.provision_dotfiles_inline(name, inp["dotfiles_inline"])
+                report.append(
+                    await self.provisioner.provision_dotfiles_inline(name, inp["dotfiles_inline"])
+                )
+            else:
+                report.append(ProvisioningStep("dotfiles", "skipped", "No dotfiles configured"))
+        else:
+            report.append(ProvisioningStep("dotfiles", "skipped", "Explicitly skipped"))
 
-        # Run setup commands
-        for cmd in inp.get("setup_commands", []):
-            cmd_result = await self.runtime.run("exec", name, "/bin/sh", "-c", cmd, timeout=300)
-            if cmd_result.returncode != 0:
-                # Log but don't fail — setup commands are best-effort
-                pass
+        # Setup commands (track each individually)
+        setup_commands = inp.get("setup_commands", [])
+        if setup_commands:
+            cmd_results = []
+            for cmd in setup_commands:
+                cmd_result = await self.runtime.run("exec", name, "/bin/sh", "-c", cmd, timeout=300)
+                if cmd_result.returncode != 0:
+                    cmd_results.append(
+                        {"command": cmd, "status": "failed", "error": cmd_result.stderr.strip()}
+                    )
+                else:
+                    cmd_results.append({"command": cmd, "status": "success"})
+
+            all_ok = all(r["status"] == "success" for r in cmd_results)
+            succeeded = sum(1 for r in cmd_results if r["status"] == "success")
+            report.append(
+                ProvisioningStep(
+                    "setup_commands",
+                    "success" if all_ok else "partial",
+                    f"{succeeded}/{len(cmd_results)} commands succeeded",
+                    error=None
+                    if all_ok
+                    else str([r for r in cmd_results if r["status"] == "failed"]),
+                )
+            )
 
         # Save metadata
         self.store.save(
@@ -538,6 +579,10 @@ class ContainersTool:
             "workdir": workdir,
             "env_vars_injected": len(env_vars),
             "persistent": inp.get("persistent", False),
+            "provisioning_report": [
+                {"name": s.name, "status": s.status, "detail": s.detail, "error": s.error}
+                for s in report
+            ],
         }
 
     async def _op_exec(self, inp: dict[str, Any]) -> dict[str, Any]:

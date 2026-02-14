@@ -6,11 +6,23 @@ import asyncio
 import fnmatch
 import os
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .runtime import ContainerRuntime
+
+
+@dataclass
+class ProvisioningStep:
+    """Result of a single provisioning step."""
+
+    name: str
+    status: str  # "success", "skipped", "failed", "partial"
+    detail: str
+    error: str | None = None
+
 
 NEVER_PASSTHROUGH = {
     "PATH",
@@ -111,10 +123,14 @@ class ContainerProvisioner:
         home = result.stdout.strip()
         return home if home else "/root"
 
-    async def provision_git(self, container: str) -> None:
+    async def provision_git(self, container: str) -> ProvisioningStep:
         """Copy git configuration into the container."""
-        home = await self.get_container_home(container)
         host_home = Path.home()
+        if not (host_home / ".gitconfig").exists():
+            return ProvisioningStep("forward_git", "skipped", "No .gitconfig found on host")
+
+        home = await self.get_container_home(container)
+        copied: list[str] = []
         for src_name, dst_name in [
             (".gitconfig", ".gitconfig"),
             (".gitconfig.local", ".gitconfig.local"),
@@ -126,14 +142,26 @@ class ContainerProvisioner:
                 # Ensure target directory exists
                 dst_dir = str(Path(dst_path).parent)
                 await self.runtime.run("exec", container, "mkdir", "-p", dst_dir, timeout=5)
-                await self.runtime.run("cp", str(src), f"{container}:{dst_path}", timeout=10)
+                result = await self.runtime.run(
+                    "cp", str(src), f"{container}:{dst_path}", timeout=10
+                )
+                if result.returncode != 0:
+                    return ProvisioningStep(
+                        "forward_git",
+                        "failed",
+                        "Failed to copy git config",
+                        error=result.stderr.strip(),
+                    )
+                copied.append(src_name)
 
-    async def provision_gh_auth(self, container: str) -> None:
+        return ProvisioningStep("forward_git", "success", f"Copied {' + '.join(copied)}")
+
+    async def provision_gh_auth(self, container: str) -> ProvisioningStep:
         """Forward GitHub CLI authentication into the container."""
         gh_path = shutil.which("gh")
         if not gh_path:
-            return
-        home = await self.get_container_home(container)
+            return ProvisioningStep("forward_gh", "skipped", "gh CLI not found on host")
+
         # Extract token from host gh cli
         proc = await asyncio.create_subprocess_exec(
             "gh",
@@ -144,17 +172,29 @@ class ContainerProvisioner:
         )
         stdout, _ = await proc.communicate()
         if proc.returncode != 0:
-            return
+            return ProvisioningStep(
+                "forward_gh", "skipped", "gh CLI not authenticated — run 'gh auth login' on host"
+            )
         token = stdout.decode().strip()
         if not token:
-            return
+            return ProvisioningStep(
+                "forward_gh", "skipped", "gh CLI not authenticated — run 'gh auth login' on host"
+            )
+
+        home = await self.get_container_home(container)
         # Inject as env vars
         bashrc = f"{home}/.bashrc"
         env_script = (
             f'echo "export GH_TOKEN={token}" >> {bashrc} && '
             f'echo "export GITHUB_TOKEN={token}" >> {bashrc}'
         )
-        await self.runtime.run("exec", container, "/bin/sh", "-c", env_script, timeout=5)
+        result = await self.runtime.run("exec", container, "/bin/sh", "-c", env_script, timeout=5)
+        if result.returncode != 0:
+            return ProvisioningStep(
+                "forward_gh", "failed", "Failed to inject GH token", error=result.stderr.strip()
+            )
+
+        detail_parts = ["GH token injected"]
         # If gh is in the container, do full auth login
         gh_check = await self.runtime.run("exec", container, "which", "gh", timeout=5)
         if gh_check.returncode == 0:
@@ -166,8 +206,11 @@ class ContainerProvisioner:
                 f'echo "{token}" | gh auth login --with-token',
                 timeout=15,
             )
+            detail_parts.append("gh auth login completed")
 
-    async def fix_ssh_permissions(self, container: str) -> None:
+        return ProvisioningStep("forward_gh", "success", " + ".join(detail_parts))
+
+    async def fix_ssh_permissions(self, container: str) -> ProvisioningStep:
         """Fix SSH key permissions after bind mount.
 
         Copies keys from the read-only staging mount at /tmp/.host-ssh
@@ -185,7 +228,16 @@ class ContainerProvisioner:
             f"chmod 644 {ssh_dir}/config 2>/dev/null || true",
         ]
         for cmd in cmds:
-            await self.runtime.run("exec", container, "/bin/sh", "-c", cmd, timeout=5)
+            result = await self.runtime.run("exec", container, "/bin/sh", "-c", cmd, timeout=5)
+            if result.returncode != 0:
+                return ProvisioningStep(
+                    "forward_ssh",
+                    "failed",
+                    "Failed to fix SSH permissions",
+                    error=result.stderr.strip(),
+                )
+
+        return ProvisioningStep("forward_ssh", "success", "SSH keys mounted and permissions fixed")
 
     async def provision_dotfiles(
         self,
@@ -194,7 +246,7 @@ class ContainerProvisioner:
         script: str | None = None,
         branch: str | None = None,
         target: str = "~/.dotfiles",
-    ) -> None:
+    ) -> ProvisioningStep:
         """Clone and apply dotfiles from a git repo."""
         # Clone
         clone_cmd = "git clone --depth=1"
@@ -203,7 +255,9 @@ class ContainerProvisioner:
         clone_cmd += f" {repo} {target}"
         result = await self.runtime.run("exec", container, "/bin/sh", "-c", clone_cmd, timeout=60)
         if result.returncode != 0:
-            return  # Clone failed, skip silently
+            return ProvisioningStep(
+                "dotfiles", "failed", "Failed to clone dotfiles repo", error=result.stderr.strip()
+            )
 
         # Find and run install script
         script_candidates = (
@@ -227,7 +281,7 @@ class ContainerProvisioner:
                     f"cd {target} && chmod +x {candidate} && ./{candidate}",
                     timeout=300,
                 )
-                return
+                return ProvisioningStep("dotfiles", "success", f"Cloned {repo}, ran {candidate}")
 
         # Check for Makefile
         make_check = await self.runtime.run(
@@ -247,7 +301,7 @@ class ContainerProvisioner:
                 f"cd {target} && make",
                 timeout=300,
             )
-            return
+            return ProvisioningStep("dotfiles", "success", f"Cloned {repo}, ran make")
 
         # Fallback: smart symlink common dotfiles
         common = [
@@ -273,7 +327,11 @@ class ContainerProvisioner:
                 timeout=5,
             )
 
-    async def provision_dotfiles_inline(self, container: str, files: dict[str, str]) -> None:
+        return ProvisioningStep("dotfiles", "success", f"Cloned {repo}, symlinked common dotfiles")
+
+    async def provision_dotfiles_inline(
+        self, container: str, files: dict[str, str]
+    ) -> ProvisioningStep:
         """Write inline dotfiles content into the container."""
         for path, content in files.items():
             escaped = content.replace("'", "'\\''")
@@ -285,3 +343,5 @@ class ContainerProvisioner:
                 f"mkdir -p $(dirname ~/{path}) && cat > ~/{path} << 'AMPLIFIER_DOTFILES_EOF'\n{escaped}\nAMPLIFIER_DOTFILES_EOF",
                 timeout=10,
             )
+
+        return ProvisioningStep("dotfiles_inline", "success", f"Wrote {len(files)} dotfiles")

@@ -9,6 +9,7 @@ import pytest
 
 from amplifier_module_tool_containers.provisioner import (
     ContainerProvisioner,
+    ProvisioningStep,
     match_env_patterns,
     resolve_env_passthrough,
 )
@@ -373,3 +374,158 @@ async def test_uid_gid_mapping_explicit_user():
     assert "--user" in captured_args
     idx = captured_args.index("--user")
     assert captured_args[idx + 1] == "1000:1000"
+
+
+# ---------------------------------------------------------------------------
+# ProvisioningStep returns
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_provision_git_success_returns_step():
+    """provision_git returns ProvisioningStep with success status."""
+    calls: list[tuple[str, ...]] = []
+
+    async def _track(*args: str, **kwargs: object) -> CommandResult:
+        calls.append(args)
+        return CommandResult(0, "/home/user\n", "")
+
+    prov = _make_provisioner()
+    prov.runtime.run = _track  # type: ignore[assignment]
+
+    with patch("amplifier_module_tool_containers.provisioner.Path") as mock_path:
+        mock_home = mock_path.home.return_value
+        # Make .gitconfig exist
+        gitconfig_mock = type(
+            "FP", (), {"exists": lambda self: True, "__str__": lambda self: "/fakehome/.gitconfig"}
+        )()
+        gitconfig_local_mock = type(
+            "FP",
+            (),
+            {"exists": lambda self: False, "__str__": lambda self: "/fakehome/.gitconfig.local"},
+        )()
+        known_hosts_mock = type(
+            "FP",
+            (),
+            {"exists": lambda self: False, "__str__": lambda self: "/fakehome/.ssh/known_hosts"},
+        )()
+
+        def _truediv(self, key):
+            if key == ".gitconfig":
+                return gitconfig_mock
+            if key == ".gitconfig.local":
+                return gitconfig_local_mock
+            if key == ".ssh/known_hosts":
+                return known_hosts_mock
+            return type(
+                "FP", (), {"exists": lambda s: False, "__str__": lambda s: f"/fakehome/{key}"}
+            )()
+
+        mock_home.__truediv__ = _truediv
+
+        step = await prov.provision_git("c1")
+
+    assert isinstance(step, ProvisioningStep)
+    assert step.name == "forward_git"
+    assert step.status == "success"
+    assert ".gitconfig" in step.detail
+    assert step.error is None
+
+
+@pytest.mark.asyncio
+async def test_provision_git_skipped_no_config():
+    """provision_git returns skipped when no .gitconfig exists."""
+    prov = _make_provisioner()
+
+    with patch("amplifier_module_tool_containers.provisioner.Path") as mock_path:
+        mock_home = mock_path.home.return_value
+        # .gitconfig does not exist
+        no_file = type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: "/fakehome/.gitconfig"}
+        )()
+        mock_home.__truediv__ = lambda self, key: no_file
+
+        step = await prov.provision_git("c1")
+
+    assert isinstance(step, ProvisioningStep)
+    assert step.name == "forward_git"
+    assert step.status == "skipped"
+    assert "No .gitconfig" in step.detail
+
+
+@pytest.mark.asyncio
+async def test_provision_gh_skipped_no_cli():
+    """provision_gh_auth returns skipped when gh CLI not found."""
+    prov = _make_provisioner()
+
+    with patch("amplifier_module_tool_containers.provisioner.shutil.which", return_value=None):
+        step = await prov.provision_gh_auth("c1")
+
+    assert isinstance(step, ProvisioningStep)
+    assert step.name == "forward_gh"
+    assert step.status == "skipped"
+    assert "not found" in step.detail
+
+
+@pytest.mark.asyncio
+async def test_provision_gh_skipped_not_authenticated():
+    """provision_gh_auth returns skipped when gh auth token fails."""
+    prov = _make_provisioner()
+
+    with (
+        patch(
+            "amplifier_module_tool_containers.provisioner.shutil.which", return_value="/usr/bin/gh"
+        ),
+        patch(
+            "amplifier_module_tool_containers.provisioner.asyncio.create_subprocess_exec"
+        ) as mock_proc,
+    ):
+        proc = AsyncMock()
+        proc.communicate.return_value = (b"", b"not logged in")
+        proc.returncode = 1
+        mock_proc.return_value = proc
+
+        step = await prov.provision_gh_auth("c1")
+
+    assert isinstance(step, ProvisioningStep)
+    assert step.name == "forward_gh"
+    assert step.status == "skipped"
+    assert "not authenticated" in step.detail
+
+
+@pytest.mark.asyncio
+async def test_fix_ssh_returns_success_step():
+    """fix_ssh_permissions returns ProvisioningStep with success status."""
+    prov = _make_provisioner()
+    prov.runtime.run = AsyncMock(return_value=CommandResult(0, "/home/user\n", ""))
+
+    step = await prov.fix_ssh_permissions("c1")
+
+    assert isinstance(step, ProvisioningStep)
+    assert step.name == "forward_ssh"
+    assert step.status == "success"
+    assert "SSH keys" in step.detail
+
+
+@pytest.mark.asyncio
+async def test_fix_ssh_returns_failed_step():
+    """fix_ssh_permissions returns failed when a command errors."""
+    call_count = 0
+
+    async def _fail_on_second(*args: str, **kwargs: object) -> CommandResult:
+        nonlocal call_count
+        call_count += 1
+        # First call is get_container_home, second is mkdir
+        if call_count <= 2:
+            return CommandResult(0, "/home/user\n", "")
+        return CommandResult(1, "", "permission denied")
+
+    prov = _make_provisioner()
+    prov.runtime.run = _fail_on_second  # type: ignore[assignment]
+
+    step = await prov.fix_ssh_permissions("c1")
+
+    assert isinstance(step, ProvisioningStep)
+    assert step.name == "forward_ssh"
+    assert step.status == "failed"
+    assert step.error is not None

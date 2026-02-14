@@ -81,9 +81,7 @@ async def test_auto_preflight_on_first_create(tool: ContainersTool):
     tool._preflight_passed = False
     tool.runtime._runtime = None  # Force no runtime
     with patch("shutil.which", return_value=None):
-        result = await tool.execute(
-            "containers", {"operation": "create", "name": "test"}
-        )
+        result = await tool.execute("containers", {"operation": "create", "name": "test"})
     assert "error" in result
     assert "not ready" in result["error"].lower()
 
@@ -153,3 +151,114 @@ async def test_list_empty(tool: ContainersTool):
     result = await tool.execute("containers", {"operation": "list"})
     assert result["containers"] == []
     assert result["count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Provisioning report in create
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_returns_provisioning_report(tool: ContainersTool):
+    """create operation returns provisioning_report in result."""
+    tool._preflight_passed = True
+
+    async def _mock_run(*args: str, **kwargs: object) -> CommandResult:
+        if args and args[0] == "run":
+            return CommandResult(0, "abc123def456\n", "")
+        return CommandResult(0, "/root\n", "")
+
+    tool.runtime.run = _mock_run  # type: ignore[assignment]
+    tool.provisioner.runtime.run = _mock_run  # type: ignore[assignment]
+
+    # Patch out gh CLI and gitconfig so provisioning takes known paths
+    with (
+        patch("amplifier_module_tool_containers.provisioner.shutil.which", return_value=None),
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        mock_home = mock_path.home.return_value
+        no_file = type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: "/fake/.gitconfig"}
+        )()
+        mock_home.__truediv__ = lambda self, key: no_file
+
+        result = await tool.execute(
+            "containers",
+            {
+                "operation": "create",
+                "name": "test-report",
+                "forward_git": True,
+                "forward_gh": True,
+                "forward_ssh": False,
+            },
+        )
+
+    assert "provisioning_report" in result
+    report = result["provisioning_report"]
+    assert isinstance(report, list)
+    assert len(report) > 0
+    # Each entry has the required keys
+    for entry in report:
+        assert "name" in entry
+        assert "status" in entry
+        assert "detail" in entry
+        assert "error" in entry
+    # Verify specific steps are present
+    step_names = [e["name"] for e in report]
+    assert "env_passthrough" in step_names
+    assert "forward_git" in step_names
+    assert "forward_gh" in step_names
+    assert "forward_ssh" in step_names
+    assert "dotfiles" in step_names
+
+
+@pytest.mark.asyncio
+async def test_provisioning_report_setup_command_partial(tool: ContainersTool):
+    """When some setup_commands fail, report shows partial status."""
+    tool._preflight_passed = True
+    call_count = 0
+
+    async def _mock_run(*args: str, **kwargs: object) -> CommandResult:
+        nonlocal call_count
+        call_count += 1
+        if args and args[0] == "run":
+            return CommandResult(0, "abc123def456\n", "")
+        # Fail the second setup command (detect by the command content)
+        if args and len(args) >= 5 and args[0] == "exec":
+            cmd_str = args[4] if len(args) > 4 else ""
+            if cmd_str == "failing-command":
+                return CommandResult(1, "", "command not found")
+        return CommandResult(0, "/root\n", "")
+
+    tool.runtime.run = _mock_run  # type: ignore[assignment]
+    tool.provisioner.runtime.run = _mock_run  # type: ignore[assignment]
+
+    with (
+        patch("amplifier_module_tool_containers.provisioner.shutil.which", return_value=None),
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        mock_home = mock_path.home.return_value
+        no_file = type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: "/fake/.gitconfig"}
+        )()
+        mock_home.__truediv__ = lambda self, key: no_file
+
+        result = await tool.execute(
+            "containers",
+            {
+                "operation": "create",
+                "name": "test-partial",
+                "forward_git": False,
+                "forward_gh": False,
+                "forward_ssh": False,
+                "dotfiles_skip": True,
+                "setup_commands": ["echo hello", "failing-command"],
+            },
+        )
+
+    assert "provisioning_report" in result
+    report = result["provisioning_report"]
+    setup_step = next(e for e in report if e["name"] == "setup_commands")
+    assert setup_step["status"] == "partial"
+    assert "1/2" in setup_step["detail"]
+    assert setup_step["error"] is not None
