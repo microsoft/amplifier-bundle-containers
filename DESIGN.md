@@ -81,11 +81,10 @@ amplifier-bundle-containers/
 │   ├── tool-containers/                   # Core tool module
 │   │   ├── pyproject.toml
 │   │   └── amplifier_module_tool_containers/
-│   │       ├── __init__.py                # Tool class + mount()
+│   │       ├── __init__.py                # Tool class, lifecycle, provisioning + mount()
 │   │       ├── runtime.py                 # Docker/Podman detection
-│   │       ├── provisioner.py             # Identity forwarding + dotfiles
-│   │       ├── images.py                  # Image selection + purpose profiles
-│   │       └── lifecycle.py               # Container lifecycle
+│   │       ├── provisioner.py             # Env var matching and passthrough
+│   │       └── images.py                  # Purpose profiles and image selection
 │   └── hooks-container-safety/            # Optional safety hooks
 │       ├── pyproject.toml
 │       └── amplifier_module_hooks_container_safety/
@@ -94,7 +93,6 @@ amplifier-bundle-containers/
 │   └── amplifier-base/
 │       └── Dockerfile
 ├── docs/
-│   ├── ARCHITECTURE.md
 │   └── PLAN.md
 ├── README.md
 └── LICENSE
@@ -141,6 +139,8 @@ Implementation: `--user $(id -u):$(id -g)` is added to `docker run` by default. 
 | `status` | Detailed status with optional health check |
 | `destroy` | Stop and remove container |
 | `destroy_all` | Remove all managed containers |
+| `create_network` | Docker network for service stacks |
+| `destroy_network` | Remove network |
 
 ### File Transfer
 | Operation | Description |
@@ -154,11 +154,9 @@ Implementation: `--user $(id -u):$(id -g)` is added to `docker run` by default. 
 | `snapshot` | Commit container state as named image |
 | `restore` | Create container from snapshot |
 
-### Multi-Container (Phase 3)
+### Multi-Container (Phase 4)
 | Operation | Description |
 |-----------|-------------|
-| `create_network` | Docker network for service stacks |
-| `destroy_network` | Remove network |
 | `compose_up` | docker-compose pass-through |
 | `compose_down` | Tear down compose services |
 

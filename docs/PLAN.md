@@ -722,6 +722,8 @@ async def execute(self, tool_name: str, tool_input: dict) -> Any:
 
 > Goal: Fix implementation learnings from Phase 1 and add the features that make containers truly useful day-to-day: proper file ownership, visibility into what happened during setup, faster startup, try-repo auto-detection, and non-blocking long commands.
 
+> **Extraction note**: `__init__.py` is currently ~926 lines and will grow significantly with Phase 2 additions (provisioning report, caching, try-repo, background exec). As part of Task 2.2 (UID mapping) — which already touches all the provisioning methods — extract the provisioning methods (`_provision_git`, `_provision_gh_auth`, `_fix_ssh_permissions`, `_provision_dotfiles`, `_provision_dotfiles_inline`, and the new `_get_container_home`) from `__init__.py` into an expanded `provisioner.py` class (which currently only has env var matching functions). This keeps `__init__.py` focused on the tool interface and operation dispatch while provisioning logic lives in its own module.
+
 ### Task 2.1: Development Infrastructure
 
 **What**: Root-level pyproject.toml for dev dependencies and proper pytest configuration.
@@ -798,7 +800,7 @@ if user_flag:
     args.extend(["--user", user_flag])
 ```
 
-3. Update all provisioning methods to detect the home directory inside the container instead of hardcoding `/root/`:
+3. Update all provisioning methods to detect the home directory inside the container instead of hardcoding `/root/`. Add `_get_container_home()` as a method on the `ContainersTool` class in `__init__.py` (it needs access to `self.runtime.run()`):
 ```python
 async def _get_container_home(self, container: str) -> str:
     """Get the home directory of the container user."""
@@ -1250,21 +1252,25 @@ bg_cmd = (
 
 > Goal: GPU support, Docker Compose (with informed decision), and further polish.
 
-### Task 4.1: GPU Passthrough
+### Task 4.1: GPU Passthrough — Preflight Detection
 
-**What**: Support `--gpus all` for ML/AI workloads.
+**What**: Add GPU runtime detection to `preflight`. The `--gpus all` flag is already implemented in `_op_create` (added when `gpu=True`), so this task focuses on the missing preflight piece.
 
-**Changes**:
-- If `gpu=True` on create, add `--gpus all` to docker run args
-- Add GPU check to preflight: detect nvidia runtime via `docker info`
-- Safety hook already handles approval gate for GPU access
+**Already implemented** (no changes needed):
+- `_op_create` already adds `--gpus all` to docker run args when `gpu=True` is passed
+
+**Changes needed**:
+- Add a GPU-specific preflight check to `_op_preflight` that detects whether the NVIDIA container runtime is available via `docker info --format '{{.Runtimes}}'` (or equivalent)
+- The check should report whether GPU passthrough is available, not fail if it isn't (GPU is optional)
+- Include guidance when GPU is requested but runtime is not available (install `nvidia-container-toolkit`)
 
 **Tests**:
-- `test_gpu_flag_added` — --gpus all in docker run args
-- `test_gpu_preflight_check` — nvidia runtime detection
+- `test_gpu_preflight_check_available` — nvidia runtime detected, reports available
+- `test_gpu_preflight_check_unavailable` — no nvidia runtime, reports unavailable with guidance
+- `test_gpu_flag_already_in_create` — verify existing `--gpus all` in docker run args (regression guard)
 - Integration (GPU hosts only): create GPU container, run `nvidia-smi`
 
-**Done when**: `containers(create, gpu=True)` works on hosts with NVIDIA Docker runtime.
+**Done when**: `preflight` reports GPU availability. `containers(create, gpu=True)` continues to work on hosts with NVIDIA Docker runtime.
 
 ---
 
