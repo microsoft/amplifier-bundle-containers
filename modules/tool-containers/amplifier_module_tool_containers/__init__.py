@@ -147,6 +147,9 @@ class ContainersTool:
                                 "create_network",
                                 "destroy_network",
                                 "cache_clear",
+                                "exec_background",
+                                "exec_poll",
+                                "exec_cancel",
                             ],
                             "description": "Container operation to perform",
                         },
@@ -173,6 +176,10 @@ class ContainersTool:
                         "command": {
                             "type": "string",
                             "description": "Command to execute (for exec)",
+                        },
+                        "job_id": {
+                            "type": "string",
+                            "description": "Background job ID (for exec_poll/exec_cancel)",
                         },
                         "timeout": {
                             "type": "integer",
@@ -869,6 +876,100 @@ class ContainersTool:
             "network": name,
             "detail": result.stderr.strip() if result.returncode != 0 else "Network removed",
         }
+
+    async def _op_exec_background(self, inp: dict[str, Any]) -> dict[str, Any]:
+        """Start a command in the background, return a job ID."""
+        container = inp.get("container", "")
+        command = inp.get("command", "")
+        if not container or not command:
+            return {"error": "Both 'container' and 'command' are required"}
+
+        import uuid as _uuid
+
+        job_id = _uuid.uuid4().hex[:8]
+
+        # Run command in background, save PID and exit code to temp files
+        bg_cmd = (
+            f"(/bin/sh -c '{command}'; echo $? > /tmp/amp-job-{job_id}.exit) "
+            f"> /tmp/amp-job-{job_id}.out 2>&1 & "
+            f"echo $! > /tmp/amp-job-{job_id}.pid && cat /tmp/amp-job-{job_id}.pid"
+        )
+        result = await self.runtime.run("exec", container, "/bin/sh", "-c", bg_cmd, timeout=10)
+        pid = result.stdout.strip()
+
+        return {
+            "job_id": job_id,
+            "pid": pid,
+            "container": container,
+            "command": command,
+        }
+
+    async def _op_exec_poll(self, inp: dict[str, Any]) -> dict[str, Any]:
+        """Check status and get partial output of a background job."""
+        container = inp.get("container", "")
+        job_id = inp.get("job_id", "")
+        if not container or not job_id:
+            return {"error": "Both 'container' and 'job_id' are required"}
+
+        # Check if process is still running
+        pid_check = await self.runtime.run(
+            "exec",
+            container,
+            "/bin/sh",
+            "-c",
+            f"kill -0 $(cat /tmp/amp-job-{job_id}.pid 2>/dev/null) 2>/dev/null && echo running || echo done",
+            timeout=5,
+        )
+        running = "running" in pid_check.stdout
+
+        # Get output (tail last 100 lines)
+        output = await self.runtime.run(
+            "exec",
+            container,
+            "/bin/sh",
+            "-c",
+            f"tail -100 /tmp/amp-job-{job_id}.out 2>/dev/null",
+            timeout=5,
+        )
+
+        # Get exit code if done
+        exit_code = None
+        if not running:
+            ec = await self.runtime.run(
+                "exec",
+                container,
+                "/bin/sh",
+                "-c",
+                f"cat /tmp/amp-job-{job_id}.exit 2>/dev/null",
+                timeout=5,
+            )
+            ec_str = ec.stdout.strip()
+            if ec_str.isdigit():
+                exit_code = int(ec_str)
+
+        return {
+            "job_id": job_id,
+            "running": running,
+            "output": output.stdout,
+            "exit_code": exit_code,
+        }
+
+    async def _op_exec_cancel(self, inp: dict[str, Any]) -> dict[str, Any]:
+        """Kill a background job."""
+        container = inp.get("container", "")
+        job_id = inp.get("job_id", "")
+        if not container or not job_id:
+            return {"error": "Both 'container' and 'job_id' are required"}
+
+        await self.runtime.run(
+            "exec",
+            container,
+            "/bin/sh",
+            "-c",
+            f"kill $(cat /tmp/amp-job-{job_id}.pid 2>/dev/null) 2>/dev/null",
+            timeout=5,
+        )
+        return {"job_id": job_id, "cancelled": True}
 
     async def _op_cache_clear(self, inp: dict[str, Any]) -> dict[str, Any]:
         """Remove locally cached purpose images."""

@@ -482,3 +482,132 @@ async def test_try_repo_schema_includes_repo_url(tool: ContainersTool):
     schema = defs[0]["input_schema"]
     assert "repo_url" in schema["properties"]
     assert schema["properties"]["repo_url"]["type"] == "string"
+
+
+# ---------------------------------------------------------------------------
+# Background execution
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exec_background_returns_job_id(tool: ContainersTool, mock_successful_run):
+    """exec_background returns a job_id and pid."""
+    tool.runtime.run = mock_successful_run
+    tool._preflight_passed = True
+
+    # Mock run to return a PID
+    async def _bg_run(*args, **kwargs):
+        return CommandResult(returncode=0, stdout="12345\n", stderr="")
+
+    tool.runtime.run = _bg_run
+
+    result = await tool.execute(
+        "containers",
+        {
+            "operation": "exec_background",
+            "container": "test-container",
+            "command": "sleep 10",
+        },
+    )
+    assert "job_id" in result
+    assert result["pid"] == "12345"
+    assert result["container"] == "test-container"
+
+
+@pytest.mark.asyncio
+async def test_exec_background_requires_container_and_command(tool: ContainersTool):
+    """exec_background returns error if container or command missing."""
+    result = await tool.execute(
+        "containers",
+        {
+            "operation": "exec_background",
+            "container": "test",
+        },
+    )
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_exec_poll_running(tool: ContainersTool):
+    """exec_poll reports running=True when process is active."""
+    call_count = 0
+
+    async def _mock_run(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:  # kill -0 check
+            return CommandResult(returncode=0, stdout="running\n", stderr="")
+        else:  # tail output
+            return CommandResult(returncode=0, stdout="partial output\n", stderr="")
+
+    tool.runtime.run = _mock_run
+
+    result = await tool.execute(
+        "containers",
+        {
+            "operation": "exec_poll",
+            "container": "test-container",
+            "job_id": "abc12345",
+        },
+    )
+    assert result["running"] is True
+    assert "partial output" in result["output"]
+    assert result["exit_code"] is None
+
+
+@pytest.mark.asyncio
+async def test_exec_poll_completed(tool: ContainersTool):
+    """exec_poll reports running=False with exit_code when done."""
+    call_count = 0
+
+    async def _mock_run(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:  # kill -0 check
+            return CommandResult(returncode=0, stdout="done\n", stderr="")
+        elif call_count == 2:  # tail output
+            return CommandResult(returncode=0, stdout="all done\n", stderr="")
+        else:  # cat exit code
+            return CommandResult(returncode=0, stdout="0\n", stderr="")
+
+    tool.runtime.run = _mock_run
+
+    result = await tool.execute(
+        "containers",
+        {
+            "operation": "exec_poll",
+            "container": "test-container",
+            "job_id": "abc12345",
+        },
+    )
+    assert result["running"] is False
+    assert result["exit_code"] == 0
+
+
+@pytest.mark.asyncio
+async def test_exec_poll_requires_container_and_job_id(tool: ContainersTool):
+    """exec_poll returns error if container or job_id missing."""
+    result = await tool.execute(
+        "containers",
+        {
+            "operation": "exec_poll",
+            "container": "test",
+        },
+    )
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_exec_cancel_returns_cancelled(tool: ContainersTool, mock_successful_run):
+    """exec_cancel returns cancelled=True."""
+    tool.runtime.run = mock_successful_run
+    result = await tool.execute(
+        "containers",
+        {
+            "operation": "exec_cancel",
+            "container": "test-container",
+            "job_id": "abc12345",
+        },
+    )
+    assert result["cancelled"] is True
+    assert result["job_id"] == "abc12345"
