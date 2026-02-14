@@ -343,6 +343,14 @@ async def test_detect_makefile_adds_make_hint(tmp_path: Path):
     assert len(hints) == 2
 
 
+def test_amplifier_profile_uses_shared_bin_dir():
+    """Amplifier profile installs uv tools to /usr/local/bin for all-user access."""
+    from amplifier_module_tool_containers.images import PURPOSE_PROFILES
+
+    profile = PURPOSE_PROFILES["amplifier"]
+    assert any("UV_TOOL_BIN_DIR=/usr/local/bin" in cmd for cmd in profile.setup_commands)
+
+
 @pytest.mark.asyncio
 async def test_detect_python_requirements_txt(tmp_path: Path):
     """requirements.txt triggers python purpose with pip install hint."""

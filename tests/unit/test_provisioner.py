@@ -503,6 +503,71 @@ async def test_fix_ssh_returns_success_step():
 
 
 @pytest.mark.asyncio
+async def test_provision_amplifier_settings_success(tmp_path):
+    """provision_amplifier_settings copies settings when they exist."""
+    # Create fake ~/.amplifier with settings files
+    amp_dir = tmp_path / ".amplifier"
+    amp_dir.mkdir()
+    (amp_dir / "settings.yaml").write_text("provider: anthropic\n")
+    (amp_dir / "settings.local.yaml").write_text("api_key: sk-test\n")
+
+    calls: list[tuple[str, ...]] = []
+
+    async def _track(*args: str, **kwargs: object) -> CommandResult:
+        calls.append(args)
+        return CommandResult(0, "/home/hostuser\n", "")
+
+    prov = _make_provisioner()
+    prov.runtime.run = _track  # type: ignore[assignment]
+
+    with patch("amplifier_module_tool_containers.provisioner.Path") as mock_path:
+        mock_path.home.return_value = tmp_path
+        step = await prov.provision_amplifier_settings("c1", target_home="/home/hostuser")
+
+    assert isinstance(step, ProvisioningStep)
+    assert step.name == "amplifier_settings"
+    assert step.status == "success"
+    assert "settings.yaml" in step.detail
+    assert "settings.local.yaml" in step.detail
+
+
+@pytest.mark.asyncio
+async def test_provision_amplifier_settings_no_dir(tmp_path):
+    """provision_amplifier_settings skips when no ~/.amplifier."""
+    # tmp_path has no .amplifier directory
+    prov = _make_provisioner()
+
+    with patch("amplifier_module_tool_containers.provisioner.Path") as mock_path:
+        mock_path.home.return_value = tmp_path
+        step = await prov.provision_amplifier_settings("c1")
+
+    assert isinstance(step, ProvisioningStep)
+    assert step.name == "amplifier_settings"
+    assert step.status == "skipped"
+    assert "No ~/.amplifier" in step.detail
+
+
+@pytest.mark.asyncio
+async def test_provision_amplifier_settings_no_files(tmp_path):
+    """provision_amplifier_settings skips when ~/.amplifier has no settings files."""
+    amp_dir = tmp_path / ".amplifier"
+    amp_dir.mkdir()
+    # Directory exists but no settings.yaml or settings.local.yaml
+
+    prov = _make_provisioner()
+    prov.runtime.run = AsyncMock(return_value=CommandResult(0, "/home/hostuser\n", ""))
+
+    with patch("amplifier_module_tool_containers.provisioner.Path") as mock_path:
+        mock_path.home.return_value = tmp_path
+        step = await prov.provision_amplifier_settings("c1", target_home="/home/hostuser")
+
+    assert isinstance(step, ProvisioningStep)
+    assert step.name == "amplifier_settings"
+    assert step.status == "skipped"
+    assert "No settings files" in step.detail
+
+
+@pytest.mark.asyncio
 async def test_fix_ssh_returns_failed_step():
     """fix_ssh_permissions returns failed when a command errors."""
     call_count = 0

@@ -247,6 +247,49 @@ class ContainerProvisioner:
 
         return ProvisioningStep("forward_ssh", "success", "SSH keys mounted and permissions fixed")
 
+    async def provision_amplifier_settings(
+        self, container: str, target_home: str | None = None
+    ) -> ProvisioningStep:
+        """Forward Amplifier settings into the container."""
+        home = Path.home()
+        amplifier_dir = home / ".amplifier"
+        if not amplifier_dir.exists():
+            return ProvisioningStep(
+                "amplifier_settings", "skipped", "No ~/.amplifier directory on host"
+            )
+
+        target = await self.get_container_home(container, target_home=target_home)
+
+        # Create target directory
+        await self.runtime.run(
+            "exec",
+            container,
+            "/bin/sh",
+            "-c",
+            f"mkdir -p {target}/.amplifier",
+            timeout=5,
+        )
+
+        files_copied = []
+        for settings_file in ["settings.yaml", "settings.local.yaml"]:
+            src = amplifier_dir / settings_file
+            if src.exists():
+                await self.runtime.run(
+                    "cp",
+                    str(src),
+                    f"{container}:{target}/.amplifier/{settings_file}",
+                    timeout=10,
+                )
+                files_copied.append(settings_file)
+
+        if not files_copied:
+            return ProvisioningStep(
+                "amplifier_settings", "skipped", "No settings files found in ~/.amplifier"
+            )
+        return ProvisioningStep(
+            "amplifier_settings", "success", f"Copied {', '.join(files_copied)}"
+        )
+
     async def provision_dotfiles(
         self,
         container: str,

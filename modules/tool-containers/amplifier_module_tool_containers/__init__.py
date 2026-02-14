@@ -236,6 +236,14 @@ class ContainersTool:
                             "type": "string",
                             "description": "Snapshot name (for snapshot/restore)",
                         },
+                        "amplifier_bundle": {
+                            "type": "string",
+                            "description": "Bundle URI to configure inside the container (amplifier purpose only)",
+                        },
+                        "amplifier_version": {
+                            "type": "string",
+                            "description": "Amplifier version to install (default: latest, amplifier purpose only)",
+                        },
                         "cache_bust": {
                             "type": "boolean",
                             "default": False,
@@ -623,6 +631,34 @@ class ContainersTool:
                 report.append(ProvisioningStep("dotfiles", "skipped", "No dotfiles configured"))
         else:
             report.append(ProvisioningStep("dotfiles", "skipped", "Explicitly skipped"))
+
+        # Amplifier settings forwarding (only for amplifier purpose)
+        if purpose == "amplifier":
+            report.append(
+                await self.provisioner.provision_amplifier_settings(name, target_home=target_home)
+            )
+
+        # Amplifier version pinning (only for amplifier purpose)
+        if purpose == "amplifier" and inp.get("amplifier_version"):
+            version = inp["amplifier_version"]
+            # Replace the generic install with versioned
+            inp["setup_commands"] = [
+                cmd.replace(
+                    "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install amplifier",
+                    f"UV_TOOL_BIN_DIR=/usr/local/bin uv tool install amplifier=={version}",
+                )
+                if "uv tool install amplifier" in cmd
+                else cmd
+                for cmd in inp.get("setup_commands", [])
+            ]
+
+        # Amplifier bundle configuration (only for amplifier purpose)
+        if purpose == "amplifier" and inp.get("amplifier_bundle"):
+            bundle_uri = inp["amplifier_bundle"]
+            inp.setdefault("setup_commands", [])
+            inp["setup_commands"].append(
+                f"amplifier bundle add {bundle_uri} --app 2>/dev/null || true"
+            )
 
         # Setup commands (track each individually)
         setup_commands = inp.get("setup_commands", [])

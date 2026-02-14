@@ -75,7 +75,7 @@ PURPOSE_PROFILES: dict[str, PurposeProfile] = {
         packages=["git", "curl", "jq"],
         setup_commands=[
             "pip install --quiet uv",
-            "uv tool install amplifier",
+            "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install amplifier",
         ],
         forward_git=True,
         forward_gh=True,

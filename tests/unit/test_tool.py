@@ -958,3 +958,173 @@ def test_as_root_in_schema(tool: ContainersTool):
     schema = defs[0]["input_schema"]
     assert "as_root" in schema["properties"]
     assert schema["properties"]["as_root"]["type"] == "boolean"
+
+
+# ---------------------------------------------------------------------------
+# Amplifier purpose parameters
+# ---------------------------------------------------------------------------
+
+
+def test_amplifier_version_in_schema(tool: ContainersTool):
+    """amplifier_version is in tool_definitions."""
+    defs = tool.tool_definitions
+    schema = defs[0]["input_schema"]
+    assert "amplifier_version" in schema["properties"]
+    assert schema["properties"]["amplifier_version"]["type"] == "string"
+
+
+def test_amplifier_bundle_in_schema(tool: ContainersTool):
+    """amplifier_bundle is in tool_definitions."""
+    defs = tool.tool_definitions
+    schema = defs[0]["input_schema"]
+    assert "amplifier_bundle" in schema["properties"]
+    assert schema["properties"]["amplifier_bundle"]["type"] == "string"
+
+
+@pytest.mark.asyncio
+async def test_amplifier_version_modifies_install(tool: ContainersTool):
+    """amplifier_version param pins the install version."""
+    tool._preflight_passed = True
+    executed_commands: list[str] = []
+
+    async def _mock_run(*args: str, **kwargs: object) -> CommandResult:
+        if args and args[0] == "exec" and len(args) > 4:
+            executed_commands.append(args[4])
+        if args and args[0] == "run":
+            return CommandResult(0, "abc123def456\n", "")
+        # No cache
+        if args and args[0] == "image":
+            return CommandResult(1, "", "No such image")
+        # commit succeeds
+        if args and args[0] == "commit":
+            return CommandResult(0, "sha256:abc\n", "")
+        return CommandResult(0, "/root\n", "")
+
+    tool.runtime.run = _mock_run  # type: ignore[assignment]
+    tool.provisioner.runtime.run = _mock_run  # type: ignore[assignment]
+
+    with (
+        patch("amplifier_module_tool_containers.provisioner.shutil.which", return_value=None),
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        mock_home = mock_path.home.return_value
+        no_file = type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: "/fake/.gitconfig"}
+        )()
+        mock_home.__truediv__ = lambda self, key: no_file
+
+        result = await tool.execute(
+            "containers",
+            {
+                "operation": "create",
+                "name": "test-amp-ver",
+                "purpose": "amplifier",
+                "amplifier_version": "1.0.0",
+                "forward_git": False,
+                "forward_gh": False,
+                "forward_ssh": False,
+                "dotfiles_skip": True,
+            },
+        )
+
+    assert result.get("success") is True
+    # Verify the versioned install command was executed
+    assert any("amplifier==1.0.0" in cmd for cmd in executed_commands)
+    # Verify the unversioned command was NOT executed
+    assert not any(
+        "uv tool install amplifier" in cmd and "amplifier==" not in cmd for cmd in executed_commands
+    )
+
+
+@pytest.mark.asyncio
+async def test_amplifier_bundle_adds_config_command(tool: ContainersTool):
+    """amplifier_bundle param adds bundle configuration command."""
+    tool._preflight_passed = True
+    executed_commands: list[str] = []
+
+    async def _mock_run(*args: str, **kwargs: object) -> CommandResult:
+        if args and args[0] == "exec" and len(args) > 4:
+            executed_commands.append(args[4])
+        if args and args[0] == "run":
+            return CommandResult(0, "abc123def456\n", "")
+        if args and args[0] == "image":
+            return CommandResult(1, "", "No such image")
+        if args and args[0] == "commit":
+            return CommandResult(0, "sha256:abc\n", "")
+        return CommandResult(0, "/root\n", "")
+
+    tool.runtime.run = _mock_run  # type: ignore[assignment]
+    tool.provisioner.runtime.run = _mock_run  # type: ignore[assignment]
+
+    with (
+        patch("amplifier_module_tool_containers.provisioner.shutil.which", return_value=None),
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        mock_home = mock_path.home.return_value
+        no_file = type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: "/fake/.gitconfig"}
+        )()
+        mock_home.__truediv__ = lambda self, key: no_file
+
+        result = await tool.execute(
+            "containers",
+            {
+                "operation": "create",
+                "name": "test-amp-bundle",
+                "purpose": "amplifier",
+                "amplifier_bundle": "github:myorg/mybundle",
+                "forward_git": False,
+                "forward_gh": False,
+                "forward_ssh": False,
+                "dotfiles_skip": True,
+            },
+        )
+
+    assert result.get("success") is True
+    # Verify the bundle add command was executed
+    assert any("amplifier bundle add github:myorg/mybundle" in cmd for cmd in executed_commands)
+
+
+@pytest.mark.asyncio
+async def test_amplifier_settings_provisioned(tool: ContainersTool):
+    """amplifier purpose triggers provision_amplifier_settings."""
+    tool._preflight_passed = True
+
+    async def _mock_run(*args: str, **kwargs: object) -> CommandResult:
+        if args and args[0] == "run":
+            return CommandResult(0, "abc123def456\n", "")
+        if args and args[0] == "image":
+            return CommandResult(1, "", "No such image")
+        if args and args[0] == "commit":
+            return CommandResult(0, "sha256:abc\n", "")
+        return CommandResult(0, "/root\n", "")
+
+    tool.runtime.run = _mock_run  # type: ignore[assignment]
+    tool.provisioner.runtime.run = _mock_run  # type: ignore[assignment]
+
+    with (
+        patch("amplifier_module_tool_containers.provisioner.shutil.which", return_value=None),
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        mock_home = mock_path.home.return_value
+        no_file = type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: "/fake/.gitconfig"}
+        )()
+        mock_home.__truediv__ = lambda self, key: no_file
+
+        result = await tool.execute(
+            "containers",
+            {
+                "operation": "create",
+                "name": "test-amp-settings",
+                "purpose": "amplifier",
+                "forward_git": False,
+                "forward_gh": False,
+                "forward_ssh": False,
+                "dotfiles_skip": True,
+            },
+        )
+
+    assert "provisioning_report" in result
+    step_names = [e["name"] for e in result["provisioning_report"]]
+    assert "amplifier_settings" in step_names
