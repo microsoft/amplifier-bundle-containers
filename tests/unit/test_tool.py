@@ -38,7 +38,7 @@ def test_tool_definitions_valid(tool: ContainersTool):
 @pytest.mark.asyncio
 async def test_unknown_operation_returns_error(tool: ContainersTool):
     """execute with bad operation returns error dict."""
-    result = await tool.execute("containers", {"operation": "teleport"})
+    result = await tool.execute({"operation": "teleport"})
     assert "error" in result
     assert "teleport" in result["error"]
 
@@ -54,7 +54,7 @@ async def test_preflight_all_pass(tool: ContainersTool):
     tool.runtime.run = AsyncMock(return_value=CommandResult(0, "{}", ""))
     tool.runtime.is_daemon_running = AsyncMock(return_value=True)
     tool.runtime.user_has_permissions = AsyncMock(return_value=True)
-    result = await tool.execute("containers", {"operation": "preflight"})
+    result = await tool.execute({"operation": "preflight"})
     assert result["ready"] is True
     assert result["runtime"] == "docker"
     assert all(c["passed"] for c in result["checks"])
@@ -65,7 +65,7 @@ async def test_preflight_no_runtime(tool: ContainersTool):
     """Mock detect() to return None."""
     tool.runtime._runtime = None  # Reset cache
     with patch("shutil.which", return_value=None):
-        result = await tool.execute("containers", {"operation": "preflight"})
+        result = await tool.execute({"operation": "preflight"})
     assert result["ready"] is False
     assert result["runtime"] is None
 
@@ -81,7 +81,7 @@ async def test_auto_preflight_on_first_create(tool: ContainersTool):
     tool._preflight_passed = False
     tool.runtime._runtime = None  # Force no runtime
     with patch("shutil.which", return_value=None):
-        result = await tool.execute("containers", {"operation": "create", "name": "test"})
+        result = await tool.execute({"operation": "create", "name": "test"})
     assert "error" in result
     assert "not ready" in result["error"].lower()
 
@@ -94,14 +94,14 @@ async def test_auto_preflight_on_first_create(tool: ContainersTool):
 @pytest.mark.asyncio
 async def test_exec_requires_container_and_command(tool: ContainersTool):
     """Returns error if missing container or command."""
-    result = await tool.execute("containers", {"operation": "exec"})
+    result = await tool.execute({"operation": "exec"})
     assert "error" in result
     assert "required" in result["error"].lower()
 
-    result = await tool.execute("containers", {"operation": "exec", "container": "c1"})
+    result = await tool.execute({"operation": "exec", "container": "c1"})
     assert "error" in result
 
-    result = await tool.execute("containers", {"operation": "exec", "command": "ls"})
+    result = await tool.execute({"operation": "exec", "command": "ls"})
     assert "error" in result
 
 
@@ -113,7 +113,7 @@ async def test_exec_requires_container_and_command(tool: ContainersTool):
 @pytest.mark.asyncio
 async def test_destroy_all_requires_confirm(tool: ContainersTool):
     """Returns error without confirm=true."""
-    result = await tool.execute("containers", {"operation": "destroy_all"})
+    result = await tool.execute({"operation": "destroy_all"})
     assert "error" in result
     assert "confirm" in result["error"].lower()
 
@@ -127,13 +127,11 @@ async def test_destroy_all_requires_confirm(tool: ContainersTool):
 async def test_copy_in_requires_all_params(tool: ContainersTool):
     """Returns error if missing any of container/host_path/container_path."""
     result = await tool.execute(
-        "containers",
         {"operation": "copy_in", "container": "c1", "host_path": "/tmp/f"},
     )
     assert "error" in result
 
     result = await tool.execute(
-        "containers",
         {"operation": "copy_in", "host_path": "/tmp/f", "container_path": "/dst"},
     )
     assert "error" in result
@@ -148,7 +146,7 @@ async def test_copy_in_requires_all_params(tool: ContainersTool):
 async def test_list_empty(tool: ContainersTool):
     """Returns empty list when no containers."""
     tool.runtime.run = AsyncMock(return_value=CommandResult(0, "", ""))
-    result = await tool.execute("containers", {"operation": "list"})
+    result = await tool.execute({"operation": "list"})
     assert result["containers"] == []
     assert result["count"] == 0
 
@@ -183,7 +181,6 @@ async def test_create_returns_provisioning_report(tool: ContainersTool):
         mock_home.__truediv__ = lambda self, key: no_file
 
         result = await tool.execute(
-            "containers",
             {
                 "operation": "create",
                 "name": "test-report",
@@ -244,7 +241,6 @@ async def test_provisioning_report_setup_command_partial(tool: ContainersTool):
         mock_home.__truediv__ = lambda self, key: no_file
 
         result = await tool.execute(
-            "containers",
             {
                 "operation": "create",
                 "name": "test-partial",
@@ -274,7 +270,7 @@ async def test_cache_clear_requires_no_params(tool: ContainersTool):
     """cache_clear works without purpose (clears all)."""
     # Mock: no cached images found
     tool.runtime.run = AsyncMock(return_value=CommandResult(0, "", ""))
-    result = await tool.execute("containers", {"operation": "cache_clear"})
+    result = await tool.execute({"operation": "cache_clear"})
     assert result["success"] is True
     assert isinstance(result["cleared"], list)
     assert "detail" in result
@@ -284,7 +280,7 @@ async def test_cache_clear_requires_no_params(tool: ContainersTool):
 async def test_cache_clear_specific_purpose(tool: ContainersTool):
     """cache_clear with purpose targets a specific image."""
     tool.runtime.run = AsyncMock(return_value=CommandResult(0, "", ""))
-    result = await tool.execute("containers", {"operation": "cache_clear", "purpose": "python"})
+    result = await tool.execute({"operation": "cache_clear", "purpose": "python"})
     assert result["success"] is True
     assert result["cleared"] == ["python"]
 
@@ -324,7 +320,6 @@ async def test_create_result_includes_cache_used(tool: ContainersTool):
         mock_home.__truediv__ = lambda self, key: no_file
 
         result = await tool.execute(
-            "containers",
             {
                 "operation": "create",
                 "name": "test-cache-field",
@@ -374,7 +369,6 @@ async def test_create_uses_cached_image(tool: ContainersTool):
         mock_home.__truediv__ = lambda self, key: no_file
 
         result = await tool.execute(
-            "containers",
             {
                 "operation": "create",
                 "name": "test-cache-hit",
@@ -405,7 +399,6 @@ async def test_try_repo_requires_url(tool: ContainersTool):
     """try-repo purpose without repo_url returns error."""
     tool._preflight_passed = True
     result = await tool.execute(
-        "containers",
         {"operation": "create", "purpose": "try-repo"},
     )
     assert "error" in result
@@ -454,7 +447,6 @@ async def test_try_repo_adds_clone_to_setup(tool: ContainersTool):
         mock_home.__truediv__ = lambda self, key: no_file
 
         result = await tool.execute(
-            "containers",
             {
                 "operation": "create",
                 "name": "test-tryrepo",
@@ -502,7 +494,6 @@ async def test_exec_background_returns_job_id(tool: ContainersTool, mock_success
     tool.runtime.run = _bg_run
 
     result = await tool.execute(
-        "containers",
         {
             "operation": "exec_background",
             "container": "test-container",
@@ -518,7 +509,6 @@ async def test_exec_background_returns_job_id(tool: ContainersTool, mock_success
 async def test_exec_background_requires_container_and_command(tool: ContainersTool):
     """exec_background returns error if container or command missing."""
     result = await tool.execute(
-        "containers",
         {
             "operation": "exec_background",
             "container": "test",
@@ -545,7 +535,6 @@ async def test_exec_poll_running(tool: ContainersTool):
     tool.runtime.run = _mock_run
 
     result = await tool.execute(
-        "containers",
         {
             "operation": "exec_poll",
             "container": "test-container",
@@ -573,7 +562,6 @@ async def test_exec_poll_completed(tool: ContainersTool):
     tool.runtime.run = _mock_run
 
     result = await tool.execute(
-        "containers",
         {
             "operation": "exec_poll",
             "container": "test-container",
@@ -588,7 +576,6 @@ async def test_exec_poll_completed(tool: ContainersTool):
 async def test_exec_poll_requires_container_and_job_id(tool: ContainersTool):
     """exec_poll returns error if container or job_id missing."""
     result = await tool.execute(
-        "containers",
         {
             "operation": "exec_poll",
             "container": "test",
@@ -602,7 +589,6 @@ async def test_exec_cancel_returns_cancelled(tool: ContainersTool, mock_successf
     """exec_cancel returns cancelled=True."""
     tool.runtime.run = mock_successful_run
     result = await tool.execute(
-        "containers",
         {
             "operation": "exec_cancel",
             "container": "test-container",
@@ -644,7 +630,6 @@ async def test_create_no_user_flag_on_run(tool: ContainersTool):
         mock_home.__truediv__ = lambda self, key: no_file
 
         await tool.execute(
-            "containers",
             {
                 "operation": "create",
                 "name": "test-no-user-run",
@@ -683,7 +668,6 @@ async def test_create_stores_exec_user_in_metadata(tool: ContainersTool):
         mock_home.__truediv__ = lambda self, key: no_file
 
         await tool.execute(
-            "containers",
             {
                 "operation": "create",
                 "name": "test-meta",
@@ -726,7 +710,6 @@ async def test_create_creates_hostuser(tool: ContainersTool):
         mock_home.__truediv__ = lambda self, key: no_file
 
         await tool.execute(
-            "containers",
             {
                 "operation": "create",
                 "name": "test-hostuser",
@@ -766,7 +749,6 @@ async def test_create_chowns_workspace(tool: ContainersTool):
         mock_home.__truediv__ = lambda self, key: no_file
 
         await tool.execute(
-            "containers",
             {
                 "operation": "create",
                 "name": "test-chown",
@@ -793,7 +775,6 @@ async def test_exec_uses_exec_user(tool: ContainersTool):
     tool.runtime.run = _capture  # type: ignore[assignment]
 
     await tool.execute(
-        "containers",
         {
             "operation": "exec",
             "container": "test-exec",
@@ -821,7 +802,6 @@ async def test_exec_as_root_skips_user(tool: ContainersTool):
     tool.runtime.run = _capture  # type: ignore[assignment]
 
     await tool.execute(
-        "containers",
         {
             "operation": "exec",
             "container": "test-exec-root",
@@ -849,7 +829,6 @@ async def test_exec_no_mounts_no_user(tool: ContainersTool):
     tool.runtime.run = _capture  # type: ignore[assignment]
 
     await tool.execute(
-        "containers",
         {
             "operation": "exec",
             "container": "test-nomount",
@@ -873,7 +852,6 @@ async def test_exec_interactive_hint_includes_user(tool: ContainersTool):
     tool.runtime.run = _mock_run  # type: ignore[assignment]
 
     result = await tool.execute(
-        "containers",
         {
             "operation": "exec_interactive_hint",
             "container": "test-hint",
@@ -897,7 +875,6 @@ async def test_exec_background_uses_exec_user(tool: ContainersTool):
     tool.runtime.run = _capture  # type: ignore[assignment]
 
     await tool.execute(
-        "containers",
         {
             "operation": "exec_background",
             "container": "test-bg",
@@ -937,7 +914,6 @@ async def test_create_no_cap_drop_all(tool: ContainersTool):
         mock_home.__truediv__ = lambda self, key: no_file
 
         await tool.execute(
-            "containers",
             {
                 "operation": "create",
                 "name": "test-no-cap",
@@ -1014,7 +990,6 @@ async def test_amplifier_version_modifies_install(tool: ContainersTool):
         mock_home.__truediv__ = lambda self, key: no_file
 
         result = await tool.execute(
-            "containers",
             {
                 "operation": "create",
                 "name": "test-amp-ver",
@@ -1067,7 +1042,6 @@ async def test_amplifier_bundle_adds_config_command(tool: ContainersTool):
         mock_home.__truediv__ = lambda self, key: no_file
 
         result = await tool.execute(
-            "containers",
             {
                 "operation": "create",
                 "name": "test-amp-bundle",
@@ -1113,7 +1087,6 @@ async def test_amplifier_settings_provisioned(tool: ContainersTool):
         mock_home.__truediv__ = lambda self, key: no_file
 
         result = await tool.execute(
-            "containers",
             {
                 "operation": "create",
                 "name": "test-amp-settings",
@@ -1151,7 +1124,7 @@ async def test_gpu_preflight_nvidia_available(tool: ContainersTool):
     tool.runtime.run = _mock_run  # type: ignore[assignment]
     tool.runtime._runtime = "docker"
 
-    result = await tool.execute("containers", {"operation": "preflight"})
+    result = await tool.execute({"operation": "preflight"})
     gpu_check = next(c for c in result["checks"] if c["name"] == "gpu_runtime")
     assert gpu_check["passed"] is True
     assert "NVIDIA runtime available" in gpu_check["detail"]
@@ -1173,7 +1146,7 @@ async def test_gpu_preflight_nvidia_unavailable(tool: ContainersTool):
     tool.runtime.run = _mock_run  # type: ignore[assignment]
     tool.runtime._runtime = "docker"
 
-    result = await tool.execute("containers", {"operation": "preflight"})
+    result = await tool.execute({"operation": "preflight"})
     assert result["ready"] is True  # CRITICAL: GPU absence doesn't break preflight
     gpu_check = next(c for c in result["checks"] if c["name"] == "gpu_runtime")
     assert gpu_check["passed"] is True
@@ -1191,7 +1164,7 @@ async def test_gpu_preflight_podman_skipped(tool: ContainersTool):
     tool.runtime.run = _mock_run  # type: ignore[assignment]
     tool.runtime._runtime = "podman"
 
-    result = await tool.execute("containers", {"operation": "preflight"})
+    result = await tool.execute({"operation": "preflight"})
     gpu_check = next(c for c in result["checks"] if c["name"] == "gpu_runtime")
     assert gpu_check["passed"] is True
     assert "not supported for Podman" in gpu_check["detail"]
@@ -1213,7 +1186,7 @@ async def test_gpu_check_does_not_affect_ready(tool: ContainersTool):
     tool.runtime.run = _mock_run  # type: ignore[assignment]
     tool.runtime._runtime = "docker"
 
-    result = await tool.execute("containers", {"operation": "preflight"})
+    result = await tool.execute({"operation": "preflight"})
     assert result["ready"] is True
 
 
@@ -1239,7 +1212,6 @@ async def test_wait_healthy_succeeds_first_attempt(tool: ContainersTool):
 
     tool.runtime.run = _mock_run
     result = await tool.execute(
-        "containers",
         {
             "operation": "wait_healthy",
             "container": "test-db",
@@ -1264,7 +1236,6 @@ async def test_wait_healthy_succeeds_after_retries(tool: ContainersTool):
 
     tool.runtime.run = _mock_run
     result = await tool.execute(
-        "containers",
         {
             "operation": "wait_healthy",
             "container": "test-db",
@@ -1285,7 +1256,6 @@ async def test_wait_healthy_exhausts_retries(tool: ContainersTool):
 
     tool.runtime.run = _mock_run
     result = await tool.execute(
-        "containers",
         {
             "operation": "wait_healthy",
             "container": "test-db",
@@ -1303,7 +1273,6 @@ async def test_wait_healthy_exhausts_retries(tool: ContainersTool):
 async def test_wait_healthy_requires_params(tool: ContainersTool):
     """wait_healthy returns error if container or health_command missing."""
     result = await tool.execute(
-        "containers",
         {
             "operation": "wait_healthy",
             "container": "test-db",

@@ -61,7 +61,6 @@ async def _force_destroy(tool: ContainersTool, name: str) -> None:
     """Best-effort container cleanup."""
     try:
         await tool.execute(
-            "containers",
             {
                 "operation": "destroy",
                 "container": name,
@@ -136,7 +135,6 @@ class TestUIDMapping:
         host_file = Path.cwd() / test_file_name
         try:
             result = await tool.execute(
-                "containers",
                 {
                     "operation": "create",
                     "name": name,
@@ -154,7 +152,6 @@ class TestUIDMapping:
 
             # Create a file inside the mounted workspace
             await tool.execute(
-                "containers",
                 {
                     "operation": "exec",
                     "container": name,
@@ -181,7 +178,6 @@ class TestProvisioningReport:
         name = _unique_name()
         try:
             result = await tool.execute(
-                "containers",
                 {
                     "operation": "create",
                     "name": name,
@@ -217,7 +213,6 @@ class TestProvisioningReport:
         name = _unique_name()
         try:
             result = await tool.execute(
-                "containers",
                 {
                     "operation": "create",
                     "name": name,
@@ -246,7 +241,6 @@ class TestBackgroundExec:
         try:
             # Create container
             result = await tool.execute(
-                "containers",
                 {
                     "operation": "create",
                     "name": name,
@@ -264,7 +258,6 @@ class TestBackgroundExec:
 
             # Start background job (short sleep + echo)
             bg_result = await tool.execute(
-                "containers",
                 {
                     "operation": "exec_background",
                     "container": name,
@@ -276,7 +269,6 @@ class TestBackgroundExec:
 
             # Poll immediately — should be running
             poll1 = await tool.execute(
-                "containers",
                 {
                     "operation": "exec_poll",
                     "container": name,
@@ -290,7 +282,6 @@ class TestBackgroundExec:
             for _ in range(15):
                 await asyncio.sleep(1)
                 poll2 = await tool.execute(
-                    "containers",
                     {
                         "operation": "exec_poll",
                         "container": name,
@@ -314,7 +305,6 @@ class TestDotfilesIntegration:
         name = _unique_name()
         try:
             result = await tool.execute(
-                "containers",
                 {
                     "operation": "create",
                     "name": name,
@@ -334,7 +324,6 @@ class TestDotfilesIntegration:
 
             # Check the file exists
             exec_result = await tool.execute(
-                "containers",
                 {
                     "operation": "exec",
                     "container": name,

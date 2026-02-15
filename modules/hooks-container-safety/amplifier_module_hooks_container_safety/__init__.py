@@ -188,7 +188,7 @@ class ContainerSafetyHooks:
         return False
 
 
-async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> list[Any]:
+async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
     """Amplifier module mount point."""
     hooks = ContainerSafetyHooks(config=config)
 
@@ -198,4 +198,4 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> list[
         coordinator.hooks.register("tool:post", hooks.handle_tool_post)
         coordinator.hooks.register("session:end", hooks.handle_session_end)
 
-    return [hooks]
+    return hooks

@@ -55,7 +55,6 @@ async def _force_destroy(tool: ContainersTool, name: str) -> None:
     """Best-effort container cleanup."""
     try:
         await tool.execute(
-            "containers",
             {
                 "operation": "destroy",
                 "container": name,
@@ -120,7 +119,6 @@ async def container(tool):
     """Create a minimal test container and destroy it after the test."""
     name = _unique_name()
     result = await tool.execute(
-        "containers",
         {
             "operation": "create",
             "name": name,
@@ -147,7 +145,7 @@ async def container(tool):
 class TestPreflight:
     async def test_preflight_passes(self, tool: ContainersTool):
         """Preflight should detect the runtime and report ready."""
-        result = await tool.execute("containers", {"operation": "preflight"})
+        result = await tool.execute({"operation": "preflight"})
 
         assert result["ready"] is True
         assert result["runtime"] in ("docker", "podman")
@@ -165,7 +163,6 @@ class TestContainerLifecycle:
         try:
             # Create
             create_result = await tool.execute(
-                "containers",
                 {
                     "operation": "create",
                     "name": name,
@@ -196,7 +193,6 @@ class TestContainerLifecycle:
 
             # Destroy
             destroy_result = await tool.execute(
-                "containers",
                 {
                     "operation": "destroy",
                     "container": name,
@@ -225,7 +221,6 @@ class TestExec:
     async def test_exec_echo(self, tool: ContainersTool, container: str):
         """Execute a simple echo command and verify output."""
         result = await tool.execute(
-            "containers",
             {
                 "operation": "exec",
                 "container": container,
@@ -240,7 +235,6 @@ class TestExec:
     async def test_exec_failure(self, tool: ContainersTool, container: str):
         """Execute a command that fails and verify non-zero return."""
         result = await tool.execute(
-            "containers",
             {
                 "operation": "exec",
                 "container": container,
@@ -253,7 +247,6 @@ class TestExec:
     async def test_exec_interactive_hint(self, tool: ContainersTool, container: str):
         """Get an interactive hint and verify it contains the name and shell."""
         result = await tool.execute(
-            "containers",
             {
                 "operation": "exec_interactive_hint",
                 "container": container,
@@ -278,7 +271,6 @@ class TestEnvPassthrough:
             os.environ[env_key] = env_val
 
             create_result = await tool.execute(
-                "containers",
                 {
                     "operation": "create",
                     "name": name,
@@ -295,7 +287,6 @@ class TestEnvPassthrough:
             assert create_result.get("success"), f"Create failed: {create_result}"
 
             exec_result = await tool.execute(
-                "containers",
                 {
                     "operation": "exec",
                     "container": name,
@@ -323,7 +314,6 @@ class TestEnvPassthrough:
             os.environ[env_key] = env_val
 
             create_result = await tool.execute(
-                "containers",
                 {
                     "operation": "create",
                     "name": name,
@@ -340,7 +330,6 @@ class TestEnvPassthrough:
             assert create_result.get("success"), f"Create failed: {create_result}"
 
             exec_result = await tool.execute(
-                "containers",
                 {
                     "operation": "exec",
                     "container": name,
@@ -364,7 +353,6 @@ class TestMounts:
         name = _unique_name()
         try:
             create_result = await tool.execute(
-                "containers",
                 {
                     "operation": "create",
                     "name": name,
@@ -382,7 +370,6 @@ class TestMounts:
 
             # The /workspace directory should exist and contain host files
             exec_result = await tool.execute(
-                "containers",
                 {
                     "operation": "exec",
                     "container": name,
@@ -401,7 +388,7 @@ class TestMounts:
 class TestList:
     async def test_list_shows_container(self, tool: ContainersTool, container: str):
         """A created container should appear in the list operation."""
-        result = await tool.execute("containers", {"operation": "list"})
+        result = await tool.execute({"operation": "list"})
 
         assert result["count"] >= 1
         names = [c["name"] for c in result["containers"]]
@@ -417,7 +404,6 @@ class TestMetadata:
 
         try:
             create_result = await tool.execute(
-                "containers",
                 {
                     "operation": "create",
                     "name": name,
@@ -446,7 +432,6 @@ class TestMetadata:
 
             # Destroy should clean up metadata
             destroy_result = await tool.execute(
-                "containers",
                 {
                     "operation": "destroy",
                     "container": name,
@@ -470,7 +455,6 @@ class TestCopyInOut:
         # Copy into container
         container_path = "/tmp/test_input.txt"
         copy_in_result = await tool.execute(
-            "containers",
             {
                 "operation": "copy_in",
                 "container": container,
@@ -482,7 +466,6 @@ class TestCopyInOut:
 
         # Verify contents inside container via exec
         cat_result = await tool.execute(
-            "containers",
             {
                 "operation": "exec",
                 "container": container,
@@ -495,7 +478,6 @@ class TestCopyInOut:
         # Copy back out to a different host path
         dst_file = tmp_path / "test_output.txt"
         copy_out_result = await tool.execute(
-            "containers",
             {
                 "operation": "copy_out",
                 "container": container,

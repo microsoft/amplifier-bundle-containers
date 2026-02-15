@@ -254,7 +254,6 @@ async def test_uid_gid_mapping_default(tmp_path):
     gid = os.getgid()
 
     await tool.execute(
-        "containers",
         {
             "operation": "create",
             "name": "test-uid",
@@ -287,7 +286,6 @@ async def test_uid_gid_mapping_no_mount(tmp_path):
     tool.provisioner.runtime.run = _capture  # type: ignore[assignment]
 
     await tool.execute(
-        "containers",
         {
             "operation": "create",
             "name": "test-nouid",
@@ -321,7 +319,6 @@ async def test_uid_gid_mapping_explicit_root(tmp_path):
     tool.provisioner.runtime.run = _capture  # type: ignore[assignment]
 
     await tool.execute(
-        "containers",
         {
             "operation": "create",
             "name": "test-root",
@@ -355,7 +352,6 @@ async def test_uid_gid_mapping_explicit_user(tmp_path):
     tool.provisioner.runtime.run = _capture  # type: ignore[assignment]
 
     await tool.execute(
-        "containers",
         {
             "operation": "create",
             "name": "test-explicit",

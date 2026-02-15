@@ -117,6 +117,19 @@ class ContainersTool:
     # -- Tool protocol -------------------------------------------------------
 
     @property
+    def name(self) -> str:
+        return "containers"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Manage isolated container environments (Docker/Podman). "
+            "Use for safe repo exploration, clean dev environments, "
+            "parallel workloads, service stacks, and any scenario "
+            "requiring isolation from the host."
+        )
+
+    @property
     def tool_definitions(self) -> list[dict[str, Any]]:
         return [
             {
@@ -271,15 +284,15 @@ class ContainersTool:
             }
         ]
 
-    async def execute(self, tool_name: str, tool_input: dict[str, Any]) -> Any:
-        op = tool_input.get("operation", "")
+    async def execute(self, input: dict[str, Any]) -> Any:
+        op = input.get("operation", "")
         handler = getattr(self, f"_op_{op}", None)
         if handler is None:
             return {"error": f"Unknown operation: {op}"}
 
         # Auto-preflight before first create
         if op == "create" and not self._preflight_passed:
-            preflight = await self._op_preflight(tool_input)
+            preflight = await self._op_preflight(input)
             if not preflight["ready"]:
                 return {
                     "error": "Container runtime not ready. See preflight results.",
@@ -287,7 +300,7 @@ class ContainersTool:
                 }
             self._preflight_passed = True
 
-        return await handler(tool_input)
+        return await handler(input)
 
     # -- Caching -------------------------------------------------------------
 
@@ -1200,7 +1213,8 @@ class ContainersTool:
 # ---------------------------------------------------------------------------
 
 
-async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> list[Any]:
+async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> Any:
     """Amplifier module mount point."""
     tool = ContainersTool(config=config)
-    return [tool]
+    await coordinator.mount("tools", tool, name="containers")
+    return tool
