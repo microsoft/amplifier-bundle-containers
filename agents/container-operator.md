@@ -17,7 +17,7 @@ meta:
 
 tools:
   - module: tool-containers
-    source: "containers:modules/tool-containers"
+    source: "git+https://github.com/microsoft/amplifier-bundle-containers@main#subdirectory=modules/tool-containers"
 ---
 
 # Container Operator
