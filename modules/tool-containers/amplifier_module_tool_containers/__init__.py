@@ -130,6 +130,11 @@ class ContainersTool:
         )
 
     @property
+    def input_schema(self) -> dict[str, Any]:
+        """JSON schema for tool parameters (read by orchestrator)."""
+        return self.tool_definitions[0]["input_schema"]
+
+    @property
     def tool_definitions(self) -> list[dict[str, Any]]:
         return [
             {
