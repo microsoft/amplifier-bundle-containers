@@ -1200,7 +1200,7 @@ class ContainersTool:
 # ---------------------------------------------------------------------------
 
 
-def mount(coordinator: Any, config: dict[str, Any] | None = None) -> list[Any]:
+async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> list[Any]:
     """Amplifier module mount point."""
     tool = ContainersTool(config=config)
     return [tool]

@@ -188,7 +188,7 @@ class ContainerSafetyHooks:
         return False
 
 
-def mount(coordinator: Any, config: dict[str, Any] | None = None) -> list[Any]:
+async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> list[Any]:
     """Amplifier module mount point."""
     hooks = ContainerSafetyHooks(config=config)
 
