@@ -42,6 +42,8 @@ def tool(tmp_path):
     t.runtime = runtime
     # Keep provisioner in sync with the replaced runtime
     t.provisioner.runtime = runtime
+    # Bypass ToolResult wrapping so tests can assert on raw dicts
+    t._wrap_result = lambda result: result
     return t
 
 

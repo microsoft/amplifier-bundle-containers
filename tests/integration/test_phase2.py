@@ -117,6 +117,8 @@ async def tool(tmp_path, check_docker, ensure_image):
     """Create a ContainersTool with an isolated metadata store."""
     t = ContainersTool(config={"default_image": TEST_IMAGE})
     t.store = MetadataStore(base_dir=tmp_path / "metadata")
+    # Bypass ToolResult wrapping so tests can assert on raw dicts
+    t._wrap_result = lambda result: result
     return t
 
 

@@ -293,19 +293,34 @@ class ContainersTool:
         op = input.get("operation", "")
         handler = getattr(self, f"_op_{op}", None)
         if handler is None:
-            return {"error": f"Unknown operation: {op}"}
+            return self._wrap_result({"error": f"Unknown operation: {op}"})
 
         # Auto-preflight before first create
         if op == "create" and not self._preflight_passed:
             preflight = await self._op_preflight(input)
             if not preflight["ready"]:
-                return {
-                    "error": "Container runtime not ready. See preflight results.",
-                    "preflight": preflight,
-                }
+                return self._wrap_result(
+                    {
+                        "error": "Container runtime not ready. See preflight results.",
+                        "preflight": preflight,
+                    }
+                )
             self._preflight_passed = True
 
-        return await handler(input)
+        result = await handler(input)
+        return self._wrap_result(result)
+
+    def _wrap_result(self, result: dict[str, Any]) -> Any:
+        """Wrap a dict result in ToolResult if available, otherwise return as-is."""
+        try:
+            from amplifier_core.models import ToolResult
+        except ImportError:
+            # amplifier-core not available (e.g., in unit tests) — return raw dict
+            return result
+
+        if isinstance(result, dict) and "error" in result:
+            return ToolResult(success=False, output=result.get("error"), error=result)
+        return ToolResult(success=True, output=result)
 
     # -- Caching -------------------------------------------------------------
 
