@@ -1900,6 +1900,492 @@ If the compose file is very complex (10+ services, custom build contexts, init c
 
 ---
 
+## Phase 5: Compose Integration + Repos + Config Files
+
+> Goal: Let the LLM write docker-compose.yml (its natural language for multi-service definitions) and enhance it with our provisioning pipeline. Add `repos` for multi-repo cloning and `config_files` for arbitrary file placement.
+
+> **Key insight**: LLMs already know how to write docker-compose.yml perfectly from training data. Fighting that by inventing a custom format wastes instruction tokens. Instead, accept Compose YAML natively and add what Compose can't do (credentials, dotfiles, repos, configs, UID mapping).
+
+### Task 5.1: `compose.py` Module — Compose Lifecycle
+
+**What**: Create a new module that encapsulates Docker Compose CLI operations. This isolates compose logic from the main tool.
+
+**Files to create**:
+- `modules/tool-containers/amplifier_module_tool_containers/compose.py`
+
+**Class: `ComposeManager`**:
+
+```python
+class ComposeManager:
+    """Manages Docker Compose lifecycle via CLI."""
+
+    def __init__(self, runtime: ContainerRuntime):
+        self.runtime = runtime
+
+    async def detect_compose(self) -> bool:
+        """Check if docker compose (v2 plugin) is available."""
+        result = await self.runtime.run("compose", "version", timeout=10)
+        return result.returncode == 0
+
+    async def up(
+        self,
+        compose_file: str,
+        project_name: str,
+        detach: bool = True,
+    ) -> ComposeResult:
+        """Run docker compose up."""
+        args = ["compose", "-f", compose_file, "-p", project_name, "up"]
+        if detach:
+            args.append("-d")
+        result = await self.runtime.run(*args, timeout=300)
+        return ComposeResult(
+            success=result.returncode == 0,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
+
+    async def down(self, project_name: str) -> ComposeResult:
+        """Run docker compose down for a project."""
+        # No -f flag needed — docker compose stores project metadata
+        # and can tear down by project name alone
+        result = await self.runtime.run(
+            "compose", "-p", project_name, "down", "--remove-orphans",
+            timeout=120,
+        )
+        return ComposeResult(
+            success=result.returncode == 0,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
+
+    async def ps(self, project_name: str) -> list[dict]:
+        """Get status of compose services."""
+        result = await self.runtime.run(
+            "compose", "-p", project_name, "ps", "--format", "json",
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return []
+        import json
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return []
+
+    async def get_network_name(self, project_name: str) -> str | None:
+        """Get the default network created by compose for this project."""
+        # Compose creates {project}_default network
+        network_name = f"{project_name}_default"
+        result = await self.runtime.run(
+            "network", "inspect", network_name, timeout=10
+        )
+        if result.returncode == 0:
+            return network_name
+        return None
+```
+
+**`ComposeResult` dataclass**:
+```python
+@dataclass
+class ComposeResult:
+    success: bool
+    stdout: str
+    stderr: str
+```
+
+**Tests** (in `tests/unit/test_compose.py` — new file):
+- `test_detect_compose_available` — mock runtime returns success for `compose version`
+- `test_detect_compose_unavailable` — mock runtime returns failure
+- `test_up_builds_correct_args` — verify args include -f, -p, -d flags
+- `test_down_builds_correct_args` — verify args include -p and --remove-orphans
+- `test_ps_parses_json` — mock runtime returns JSON, verify parsing
+- `test_ps_handles_failure` — returns empty list on failure
+- `test_get_network_name` — returns `{project}_default` when network exists
+
+**Done when**: `ComposeManager` can up/down/ps/detect compose and get the network name. All tests pass.
+
+---
+
+### Task 5.2: `repos` Parameter — Multi-Repo Cloning
+
+**What**: Add a `repos` parameter to `create` that clones multiple repos into the container with optional install commands. Results appear in the provisioning report.
+
+**Files to modify**:
+- `modules/tool-containers/amplifier_module_tool_containers/__init__.py` — Add repos handling to `_op_create`
+- `modules/tool-containers/amplifier_module_tool_containers/provisioner.py` — Add `provision_repos` method
+
+**Add to provisioner.py**:
+```python
+async def provision_repos(
+    self,
+    container: str,
+    repos: list[dict[str, str]],
+) -> ProvisioningStep:
+    """Clone repos into the container and optionally run install commands."""
+    if not repos:
+        return ProvisioningStep("repos", "skipped", "No repos specified")
+
+    cloned = []
+    failed = []
+    for repo in repos:
+        url = repo.get("url", "")
+        path = repo.get("path", f"/workspace/{url.rstrip('/').split('/')[-1]}")
+        install = repo.get("install")
+
+        # Clone
+        clone_result = await self.runtime.run(
+            "exec", container, "/bin/sh", "-c",
+            f"git clone {url} {path}",
+            timeout=120,
+        )
+        if clone_result.returncode != 0:
+            failed.append({"url": url, "error": clone_result.stderr.strip()})
+            continue
+
+        # Install (optional, runs as root since it's a setup operation)
+        if install:
+            install_result = await self.runtime.run(
+                "exec", container, "/bin/sh", "-c",
+                f"cd {path} && {install}",
+                timeout=300,
+            )
+            if install_result.returncode != 0:
+                failed.append({"url": url, "error": f"Install failed: {install_result.stderr.strip()}"})
+                continue
+
+        cloned.append(url.split("/")[-1])
+
+    if failed and not cloned:
+        return ProvisioningStep(
+            "repos", "failed",
+            f"All {len(failed)} repos failed to clone",
+            error=str(failed),
+        )
+    elif failed:
+        return ProvisioningStep(
+            "repos", "partial",
+            f"{len(cloned)}/{len(cloned) + len(failed)} repos cloned",
+            error=str(failed),
+        )
+    return ProvisioningStep(
+        "repos", "success",
+        f"Cloned {len(cloned)} repos: {', '.join(cloned)}",
+    )
+```
+
+**Add to `_op_create`** — after dotfiles provisioning, before setup_commands:
+```python
+# Clone repos
+repos_list = inp.get("repos", [])
+if repos_list:
+    report.append(await self.provisioner.provision_repos(name, repos_list))
+else:
+    report.append(ProvisioningStep("repos", "skipped", "No repos specified"))
+```
+
+**Add to tool schema**:
+```python
+"repos": {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "Git URL to clone"},
+            "path": {"type": "string", "description": "Clone destination (default: /workspace/{repo-name})"},
+            "install": {"type": "string", "description": "Optional install command (e.g., 'pip install -e .')"},
+        },
+        "required": ["url"],
+    },
+    "description": "Repos to clone into the container",
+},
+```
+
+**Tests** (in `tests/unit/test_provisioner.py`):
+- `test_provision_repos_success` — 2 repos cloned, both succeed
+- `test_provision_repos_with_install` — repo cloned + install command runs
+- `test_provision_repos_clone_failure` — one repo fails, reports partial
+- `test_provision_repos_all_fail` — all fail, reports failed
+- `test_provision_repos_empty` — empty list returns skipped
+- `test_provision_repos_default_path` — url without explicit path gets /workspace/{name}
+
+**Done when**: `repos=[{url, path, install}]` on create clones repos and shows results in provisioning report.
+
+---
+
+### Task 5.3: `config_files` Parameter — Arbitrary File Placement
+
+**What**: Add a `config_files` parameter to `create` that writes files to arbitrary paths inside the container (not just `~/` like dotfiles_inline).
+
+**Files to modify**:
+- `modules/tool-containers/amplifier_module_tool_containers/__init__.py` — Add config_files handling to `_op_create`
+- `modules/tool-containers/amplifier_module_tool_containers/provisioner.py` — Add `provision_config_files` method
+
+**Add to provisioner.py**:
+```python
+async def provision_config_files(
+    self,
+    container: str,
+    config_files: dict[str, str],
+) -> ProvisioningStep:
+    """Write config files to arbitrary paths inside the container."""
+    if not config_files:
+        return ProvisioningStep("config_files", "skipped", "No config files specified")
+
+    written = []
+    failed = []
+    for path, content in config_files.items():
+        escaped = content.replace("'", "'\\''")
+        result = await self.runtime.run(
+            "exec", container, "/bin/sh", "-c",
+            f"mkdir -p $(dirname '{path}') && cat > '{path}' << 'AMPLIFIER_CONFIG_EOF'\n{escaped}\nAMPLIFIER_CONFIG_EOF",
+            timeout=10,
+        )
+        if result.returncode == 0:
+            written.append(path)
+        else:
+            failed.append({"path": path, "error": result.stderr.strip()})
+
+    if failed and not written:
+        return ProvisioningStep(
+            "config_files", "failed",
+            f"All {len(failed)} files failed",
+            error=str(failed),
+        )
+    elif failed:
+        return ProvisioningStep(
+            "config_files", "partial",
+            f"{len(written)}/{len(written) + len(failed)} files written",
+            error=str(failed),
+        )
+    return ProvisioningStep(
+        "config_files", "success",
+        f"Wrote {len(written)} files: {', '.join(written)}",
+    )
+```
+
+**Add to `_op_create`** — after repos provisioning, before setup_commands:
+```python
+# Write config files
+config_files_dict = inp.get("config_files", {})
+if config_files_dict:
+    report.append(await self.provisioner.provision_config_files(name, config_files_dict))
+else:
+    report.append(ProvisioningStep("config_files", "skipped", "No config files specified"))
+```
+
+**Add to tool schema**:
+```python
+"config_files": {
+    "type": "object",
+    "description": "Files to write: {'/path/in/container': 'file content'}",
+},
+```
+
+**Tests** (in `tests/unit/test_provisioner.py`):
+- `test_provision_config_files_success` — 2 files written, both succeed
+- `test_provision_config_files_creates_dirs` — parent directories created automatically
+- `test_provision_config_files_failure` — one file fails, reports partial
+- `test_provision_config_files_empty` — empty dict returns skipped
+
+**Done when**: `config_files={"/path": "content"}` writes files and shows results in provisioning report.
+
+---
+
+### Task 5.4: Compose Integration in `_op_create` and `_op_destroy`
+
+**What**: Wire compose into the create/destroy lifecycle. When `compose_content` or `compose_file` is provided, run compose up before creating the primary container, join the compose network, and tear down compose on destroy.
+
+**Files to modify**:
+- `modules/tool-containers/amplifier_module_tool_containers/__init__.py` — Modify `_op_create`, `_op_destroy`, `_op_status`
+- `modules/tool-containers/amplifier_module_tool_containers/compose.py` (from Task 5.1)
+
+**Changes to `_op_create`**:
+
+At the top of `_op_create`, BEFORE building docker run args:
+
+```python
+# Handle compose
+compose_content = inp.get("compose_content")
+compose_file_path = inp.get("compose_file")
+
+    # Mutual exclusion
+    if compose_content and compose_file_path:
+        return {"error": "Provide compose_content OR compose_file, not both"}
+
+compose_project = None
+compose_network = None
+
+if compose_content or compose_file_path:
+    from .compose import ComposeManager
+    compose_mgr = ComposeManager(self.runtime)
+
+    # Check compose is available
+    if not await compose_mgr.detect_compose():
+        return {"error": "docker compose not available. Install the compose plugin."}
+
+    compose_project = name  # Use container name as compose project name
+
+    if compose_content:
+        # Write compose content to a temp file on the HOST
+        import tempfile
+        compose_tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yml", prefix=f"amp-compose-{name}-", delete=False
+        )
+        compose_tmp.write(compose_content)
+        compose_tmp.close()
+        compose_file_path = compose_tmp.name
+
+    # Run compose up
+    compose_result = await compose_mgr.up(compose_file_path, compose_project)
+    if not compose_result.success:
+        return {
+            "error": f"docker compose up failed: {compose_result.stderr.strip()}",
+        }
+
+    # Get the compose network so our primary container can join it
+    compose_network = await compose_mgr.get_network_name(compose_project)
+```
+
+Then when building docker run args, if `compose_network` is set, use it as the network:
+```python
+# If compose created a network, join it instead of bridge
+if compose_network:
+    network = compose_network
+```
+
+Store compose metadata:
+```python
+# In metadata save:
+metadata["compose_project"] = compose_project
+metadata["compose_file"] = compose_file_path  # For compose down later
+metadata["compose_network"] = compose_network
+```
+
+Add compose services to provisioning report:
+```python
+if compose_project:
+    compose_services = await compose_mgr.ps(compose_project)
+    service_names = [s.get("Service", s.get("Name", "?")) for s in compose_services]
+    report.append(ProvisioningStep(
+        "compose", "success",
+        f"Started {len(compose_services)} services: {', '.join(service_names)}",
+    ))
+```
+
+**Changes to `_op_destroy`**:
+
+Before destroying the primary container, check for compose and tear it down:
+```python
+# Check if this container has compose services
+metadata = self.store.load(container)
+compose_project = (metadata or {}).get("compose_project")
+if compose_project:
+    from .compose import ComposeManager
+    compose_mgr = ComposeManager(self.runtime)
+    await compose_mgr.down(compose_project)
+    # Clean up temp compose file if it exists
+    compose_file = (metadata or {}).get("compose_file")
+    if compose_file and compose_file.startswith("/tmp/amp-compose-"):
+        import os
+        try:
+            os.unlink(compose_file)
+        except OSError:
+            pass
+```
+
+**Changes to `_op_status`**:
+
+Include compose service status when available:
+```python
+# In _op_status, after getting container status:
+compose_project = (metadata or {}).get("compose_project")
+if compose_project:
+    from .compose import ComposeManager
+    compose_mgr = ComposeManager(self.runtime)
+    compose_services = await compose_mgr.ps(compose_project)
+    status_result["compose_services"] = compose_services
+```
+
+**Add to tool schema**:
+```python
+"compose_content": {
+    "type": "string",
+    "description": "Docker Compose YAML content (the LLM writes this naturally)",
+},
+"compose_file": {
+    "type": "string",
+    "description": "Path to existing docker-compose.yml on the host",
+},
+```
+
+**Tests** (in `tests/unit/test_tool.py`):
+- `test_create_with_compose_content` — compose_content triggers compose up, primary container joins compose network
+- `test_create_compose_unavailable` — returns error when docker compose not installed
+- `test_create_compose_up_failure` — returns error when compose up fails
+- `test_destroy_with_compose` — destroy runs compose down before removing primary container
+- `test_status_includes_compose_services` — status shows compose services when present
+- `test_create_compose_content_and_file_error` — returns error when both compose_content and compose_file provided
+- `test_create_compose_in_provisioning_report` — report includes compose step with service names
+
+**Integration tests** (in `tests/integration/test_phase5.py`):
+- `test_compose_postgres_with_primary` — create with compose_content (postgres), primary container can connect via network
+- `test_compose_destroy_cleans_up` — destroy removes both primary and compose services
+- `test_repos_cloned_in_container` — create with repos, verify repos cloned inside container
+- `test_config_files_written` — create with config_files, verify files exist at correct paths
+
+**Done when**: `compose_content` on create starts compose services, primary container joins the network. Destroy tears down everything. Status shows compose services. Full provisioning report covers compose + repos + config_files.
+
+---
+
+### Task 5.5: Update Documentation
+
+**What**: Update all context docs to cover Phase 5 features.
+
+**Files to modify**:
+- `context/container-awareness.md` — Add compose_content, repos, config_files to convenience features and quick reference
+- `context/container-guide.md` — Update the "Interpreting docker-compose.yml" section to show the new native approach (compose_content parameter instead of manual translation). Keep the translation table as reference. Add repos and config_files documentation.
+- `agents/container-operator.md` — Update compose interpretation principle to use compose_content natively
+- `README.md` — Add Phase 5 features
+- `DESIGN.md` — Mark Phase 5 complete (after implementation)
+
+**Key doc change**: The container-guide's "Interpreting docker-compose.yml" section currently teaches manual translation (read YAML, issue N create calls). This should be updated to show the native approach first:
+
+```markdown
+## Using docker-compose.yml
+
+### Native Compose Support (Preferred)
+
+Pass compose YAML directly — the tool handles the rest:
+
+    containers(create, name="my-stack",
+        compose_content="""
+    services:
+      db:
+        image: postgres:16
+        environment:
+          POSTGRES_PASSWORD: dev
+      redis:
+        image: redis:7
+    """,
+        purpose="python",
+        repos=[...],
+        config_files={...},
+        forward_gh=True,
+    )
+
+The tool runs `docker compose up` for infrastructure services, creates a fully-provisioned primary container on the same network, and returns a complete provisioning report.
+
+### Manual Translation (For Complex Cases)
+
+For compose files that need our provisioning on multiple services, or when you want fine-grained control, you can still translate manually...
+```
+
+**Tests**: N/A (documentation only)
+
+**Done when**: All docs cover compose_content, repos, config_files. The compose interpretation docs show native approach first.
+
+---
+
 ## Testing Strategy
 
 ### Test Categories
@@ -1929,4 +2415,6 @@ pytest tests/ -v -m "not integration"
 - Phase 1: 43 unit + 11 integration = 54 tests
 - Phase 2: +49 tests = 103 total (87 unit + 16 integration)
 - Phase 3: +20 tests = 123 total (107 unit + 16 integration)
-- Phase 4: +5 (GPU) + ~5 (wait_healthy) = ~133 total
+- Phase 4: +10 tests = 133 total (117 unit + 16 integration)
+- Phase 5 target: ~25 additional tests (unit + integration)
+- Total target: ~158 tests

@@ -148,6 +148,7 @@ This design preserves `--security-opt=no-new-privileges` (sudo not needed — th
 | `create_network` | Docker network for service stacks |
 | `destroy_network` | Remove network |
 | `wait_healthy` | Poll health-check command until service is ready |
+| `create` (with `compose_content`) | Start compose services + provisioned primary container |
 
 ### File Transfer
 | Operation | Description |
@@ -164,7 +165,7 @@ This design preserves `--security-opt=no-new-privileges` (sudo not needed — th
 ### Deferred
 | Operation | Status |
 |-----------|--------|
-| `compose_up` / `compose_down` | Deferred — agent interprets compose YAML via create + create_network + wait_healthy instead |
+| *(none currently)* | Native compose support added in Phase 5 via `compose_content` parameter on `create` |
 
 ---
 
@@ -349,3 +350,6 @@ Two-phase user model (root setup, mapped user exec, as_root override), amplifier
 
 ### Phase 4: Extended Capabilities — COMPLETE
 GPU passthrough preflight detection. `wait_healthy` operation for startup ordering. Compose-file interpretation pattern (agent translates compose YAML to create calls). 133 tests (117 unit + 16 integration).
+
+### Phase 5: Compose Integration + Repos + Config Files
+Native Docker Compose support (LLM writes compose YAML, tool handles lifecycle). Multi-repo cloning (`repos` parameter). Arbitrary file placement (`config_files` parameter). Compose services auto-destroyed on container destroy.
