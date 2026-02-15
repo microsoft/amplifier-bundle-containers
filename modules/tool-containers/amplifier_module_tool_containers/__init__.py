@@ -8,6 +8,7 @@ defaults, and container lifecycle management.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -150,6 +151,7 @@ class ContainersTool:
                                 "exec_background",
                                 "exec_poll",
                                 "exec_cancel",
+                                "wait_healthy",
                             ],
                             "description": "Container operation to perform",
                         },
@@ -243,6 +245,20 @@ class ContainersTool:
                         "amplifier_version": {
                             "type": "string",
                             "description": "Amplifier version to install (default: latest, amplifier purpose only)",
+                        },
+                        "health_command": {
+                            "type": "string",
+                            "description": "Command to check service readiness (e.g., 'pg_isready -U postgres')",
+                        },
+                        "interval": {
+                            "type": "integer",
+                            "default": 2,
+                            "description": "Seconds between health check attempts",
+                        },
+                        "retries": {
+                            "type": "integer",
+                            "default": 15,
+                            "description": "Maximum number of health check attempts before timeout",
                         },
                         "cache_bust": {
                             "type": "boolean",
@@ -1138,6 +1154,44 @@ class ContainersTool:
             "detail": f"Cleared {len(cleared)} cached images"
             if cleared
             else "No cached images found",
+        }
+
+    async def _op_wait_healthy(self, inp: dict[str, Any]) -> dict[str, Any]:
+        """Poll a health-check command until it succeeds or retries are exhausted."""
+        container = inp.get("container", "")
+        health_command = inp.get("health_command", "")
+        if not container or not health_command:
+            return {"error": "Both 'container' and 'health_command' are required"}
+
+        interval = inp.get("interval", 2)
+        retries = inp.get("retries", 15)
+        result = None
+
+        for attempt in range(1, retries + 1):
+            result = await self.runtime.run(
+                "exec",
+                container,
+                "/bin/sh",
+                "-c",
+                health_command,
+                timeout=interval + 5,
+            )
+            if result.returncode == 0:
+                return {
+                    "healthy": True,
+                    "container": container,
+                    "attempts": attempt,
+                    "detail": f"Health check passed on attempt {attempt}/{retries}",
+                }
+            if attempt < retries:
+                await asyncio.sleep(interval)
+
+        return {
+            "healthy": False,
+            "container": container,
+            "attempts": retries,
+            "detail": f"Health check failed after {retries} attempts",
+            "last_error": result.stderr.strip() if result else "",
         }
 
 

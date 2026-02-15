@@ -1223,3 +1223,98 @@ def test_gpu_flag_in_create_schema():
     schema = t.tool_definitions[0]["input_schema"]
     assert "gpu" in schema["properties"]
     assert schema["properties"]["gpu"]["type"] == "boolean"
+
+
+# ---------------------------------------------------------------------------
+# wait_healthy
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_wait_healthy_succeeds_first_attempt(tool: ContainersTool):
+    """wait_healthy returns healthy=True when check passes immediately."""
+
+    async def _mock_run(*args, **kwargs):
+        return CommandResult(returncode=0, stdout="ready", stderr="")
+
+    tool.runtime.run = _mock_run
+    result = await tool.execute(
+        "containers",
+        {
+            "operation": "wait_healthy",
+            "container": "test-db",
+            "health_command": "pg_isready",
+        },
+    )
+    assert result["healthy"] is True
+    assert result["attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_wait_healthy_succeeds_after_retries(tool: ContainersTool):
+    """wait_healthy returns healthy=True after some failed attempts."""
+    call_count = 0
+
+    async def _mock_run(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            return CommandResult(returncode=1, stdout="", stderr="not ready")
+        return CommandResult(returncode=0, stdout="ready", stderr="")
+
+    tool.runtime.run = _mock_run
+    result = await tool.execute(
+        "containers",
+        {
+            "operation": "wait_healthy",
+            "container": "test-db",
+            "health_command": "pg_isready",
+            "interval": 0,
+        },
+    )
+    assert result["healthy"] is True
+    assert result["attempts"] == 3
+
+
+@pytest.mark.asyncio
+async def test_wait_healthy_exhausts_retries(tool: ContainersTool):
+    """wait_healthy returns healthy=False when all retries fail."""
+
+    async def _mock_run(*args, **kwargs):
+        return CommandResult(returncode=1, stdout="", stderr="connection refused")
+
+    tool.runtime.run = _mock_run
+    result = await tool.execute(
+        "containers",
+        {
+            "operation": "wait_healthy",
+            "container": "test-db",
+            "health_command": "pg_isready",
+            "interval": 0,
+            "retries": 3,
+        },
+    )
+    assert result["healthy"] is False
+    assert result["attempts"] == 3
+    assert "connection refused" in result["last_error"]
+
+
+@pytest.mark.asyncio
+async def test_wait_healthy_requires_params(tool: ContainersTool):
+    """wait_healthy returns error if container or health_command missing."""
+    result = await tool.execute(
+        "containers",
+        {
+            "operation": "wait_healthy",
+            "container": "test-db",
+        },
+    )
+    assert "error" in result
+
+
+def test_wait_healthy_in_schema():
+    """wait_healthy is in the operation enum."""
+    t = ContainersTool()
+    schema = t.tool_definitions[0]["input_schema"]
+    ops = schema["properties"]["operation"]["enum"]
+    assert "wait_healthy" in ops
