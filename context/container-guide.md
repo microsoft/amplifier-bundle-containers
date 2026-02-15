@@ -492,6 +492,82 @@ Use `amplifier_version` to pin a specific Amplifier version and `amplifier_bundl
 
 ---
 
+## Interpreting docker-compose.yml Files
+
+When a user has a docker-compose.yml and wants to use it, DON'T suggest `docker compose up`. Instead, read the file and translate it into container tool calls. This preserves our full provisioning pipeline (credentials, dotfiles, user mapping, tracking).
+
+### Translation Pattern
+
+Given a docker-compose.yml like:
+```yaml
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: dev
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+  redis:
+    image: redis:7
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:dev@db:5432/app
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "8000:8000"
+```
+
+Translate to:
+```
+containers(create_network, name="project-stack")
+
+containers(create, name="db", image="postgres:16",
+           env={"POSTGRES_PASSWORD": "dev"},
+           ports=[{"host": 5432, "container": 5432}],
+           network="project-stack")
+
+containers(wait_healthy, container="db",
+           health_command="pg_isready -U postgres",
+           interval=2, retries=15)
+
+containers(create, name="redis", image="redis:7",
+           network="project-stack")
+
+containers(create, name="app", purpose="python",
+           network="project-stack",
+           env={"DATABASE_URL": "postgresql://postgres:dev@db:5432/app",
+                "REDIS_URL": "redis://redis:6379"},
+           ports=[{"host": 8000, "container": 8000}])
+```
+
+### Translation Rules
+
+| Compose Feature | Translation |
+|----------------|-------------|
+| `image:` | `image` parameter on create |
+| `environment:` | `env` parameter on create |
+| `ports:` | `ports` parameter on create |
+| `volumes:` (bind mounts) | `mounts` parameter on create |
+| `networks:` | `create_network` + `network` parameter |
+| `depends_on: condition: service_healthy` | `wait_healthy` between creates |
+| `depends_on:` (basic) | Order your create calls correctly |
+| `healthcheck: test:` | `health_command` for wait_healthy |
+| `build:` | Not supported — ask user to build image first, then use the image |
+| `restart:` | Not applicable — ephemeral containers |
+| `env_file:` | Read the .env file, merge into `env` parameter |
+
+### When NOT to Translate
+
+If the compose file is very complex (10+ services, custom build contexts, init containers, tmpfs mounts, custom network drivers), tell the user they should use `docker compose` directly via bash. Our tool is for provisioned, managed containers — not for running arbitrary compose stacks.
+
+---
+
 ## Troubleshooting
 
 ### Container won't start

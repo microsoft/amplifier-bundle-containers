@@ -40,6 +40,7 @@ You have access to the `containers` tool for creating and managing isolated cont
 | `exec_background` | Start a long-running command, returns a job_id |
 | `exec_poll` | Check status and get output of a background job |
 | `exec_cancel` | Kill a background job |
+| `wait_healthy` | Poll health-check command until service is ready |
 
 ## The `purpose` Parameter
 
@@ -104,6 +105,12 @@ exec_background(container="agent-b", command="amplifier run 'task 2'")
 exec_poll(container="agent-a", job_id="...")
 exec_poll(container="agent-b", job_id="...")
 ```
+
+### Compose File Interpretation
+When a user has a docker-compose.yml, read the YAML and translate services
+into create + create_network + wait_healthy calls rather than suggesting
+`docker compose up`. This preserves credential forwarding, user mapping,
+and container tracking. See the container-guide for the full translation pattern.
 
 ## Important
 

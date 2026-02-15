@@ -347,5 +347,5 @@ UID/GID mapping, provisioning report, local image caching, try-repo auto-detecti
 ### Phase 3: Two-Phase User Model + Amplifier-in-Container — COMPLETE
 Two-phase user model (root setup, mapped user exec, as_root override), amplifier purpose profile polish (settings forwarding, version/bundle params, parallel-agents pattern), documentation refresh. 123 tests (107 unit + 16 integration).
 
-### Phase 4: Extended Capabilities
-GPU passthrough preflight detection. `wait_healthy` operation for health-check-based startup ordering. Compose-file interpretation pattern (documentation — the agent translates compose YAML to create calls instead of pass-through). Docker Compose native pass-through deferred indefinitely.
+### Phase 4: Extended Capabilities — COMPLETE
+GPU passthrough preflight detection. `wait_healthy` operation for startup ordering. Compose-file interpretation pattern (agent translates compose YAML to create calls). 133 tests (117 unit + 16 integration).
