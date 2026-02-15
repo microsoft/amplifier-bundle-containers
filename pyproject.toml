@@ -1,9 +1,5 @@
-[project]
-name = "amplifier-bundle-containers"
-version = "0.1.0"
-description = "Container management bundle for Amplifier"
-requires-python = ">=3.11"
-license = "MIT"
+# Tool configuration only — bundles are NOT installable Python packages.
+# Only modules inside modules/ have their own pyproject.toml with [project].
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
