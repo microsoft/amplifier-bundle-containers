@@ -7,6 +7,7 @@ bundle:
 includes:
   - bundle: git+https://github.com/microsoft/amplifier-foundation@main
   - bundle: containers:behaviors/containers
+  - bundle: containers:behaviors/container-safety
 ---
 
 # Container Management

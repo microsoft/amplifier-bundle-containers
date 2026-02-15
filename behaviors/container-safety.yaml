@@ -5,7 +5,7 @@ bundle:
 
 hooks:
   - module: hooks-container-safety
-    source: "containers:modules/hooks-container-safety"
+    source: "git+https://github.com/microsoft/amplifier-bundle-containers@main#subdirectory=modules/hooks-container-safety"
     config:
       require_approval_for:
         - gpu_access

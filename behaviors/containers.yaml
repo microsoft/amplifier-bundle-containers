@@ -5,7 +5,7 @@ bundle:
 
 tools:
   - module: tool-containers
-    source: "containers:modules/tool-containers"
+    source: "git+https://github.com/microsoft/amplifier-bundle-containers@main#subdirectory=modules/tool-containers"
     config:
       default_image: "ubuntu:24.04"
       max_containers: 10
