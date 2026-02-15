@@ -147,6 +147,7 @@ This design preserves `--security-opt=no-new-privileges` (sudo not needed — th
 | `destroy_all` | Remove all managed containers |
 | `create_network` | Docker network for service stacks |
 | `destroy_network` | Remove network |
+| `wait_healthy` | Poll health-check command until service is ready |
 
 ### File Transfer
 | Operation | Description |
@@ -160,11 +161,10 @@ This design preserves `--security-opt=no-new-privileges` (sudo not needed — th
 | `snapshot` | Commit container state as named image |
 | `restore` | Create container from snapshot |
 
-### Multi-Container (Phase 4)
-| Operation | Description |
-|-----------|-------------|
-| `compose_up` | docker-compose pass-through |
-| `compose_down` | Tear down compose services |
+### Deferred
+| Operation | Status |
+|-----------|--------|
+| `compose_up` / `compose_down` | Deferred — agent interprets compose YAML via create + create_network + wait_healthy instead |
 
 ---
 
@@ -348,4 +348,4 @@ UID/GID mapping, provisioning report, local image caching, try-repo auto-detecti
 Two-phase user model (root setup, mapped user exec, as_root override), amplifier purpose profile polish (settings forwarding, version/bundle params, parallel-agents pattern), documentation refresh. 123 tests (107 unit + 16 integration).
 
 ### Phase 4: Extended Capabilities
-GPU passthrough preflight detection. Docker Compose deferred for future evaluation.
+GPU passthrough preflight detection. `wait_healthy` operation for health-check-based startup ordering. Compose-file interpretation pattern (documentation — the agent translates compose YAML to create calls instead of pass-through). Docker Compose native pass-through deferred indefinitely.

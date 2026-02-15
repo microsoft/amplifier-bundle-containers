@@ -1628,9 +1628,275 @@ def test_gpu_flag_in_create_schema():
 
 ---
 
-### Task 4.2: Docker Compose — DEFERRED
+### Task 4.2: wait_healthy Operation
 
-Docker Compose pass-through has been deferred for future evaluation. The current `create` + `create_network` approach handles multi-service scenarios. Compose will be revisited if there's demand for users with existing docker-compose.yml files.
+**What**: Add a `wait_healthy` operation that polls a health-check command inside a container until it succeeds or times out. This closes the startup-ordering gap — the agent can wait for Postgres to accept connections before starting the app.
+
+**Files to modify**:
+- `modules/tool-containers/amplifier_module_tool_containers/__init__.py` — Add `_op_wait_healthy` method and add `wait_healthy` to operation enum
+- `tests/unit/test_tool.py` — Add unit tests
+
+**Add to operation enum**: `"wait_healthy"`
+
+**Add to input_schema properties**:
+```python
+"health_command": {
+    "type": "string",
+    "description": "Command to check service readiness (e.g., 'pg_isready -U postgres')",
+},
+"interval": {
+    "type": "integer",
+    "default": 2,
+    "description": "Seconds between health check attempts",
+},
+"retries": {
+    "type": "integer",
+    "default": 15,
+    "description": "Maximum number of health check attempts before timeout",
+},
+```
+
+**Implementation**:
+```python
+async def _op_wait_healthy(self, inp: dict[str, Any]) -> dict[str, Any]:
+    """Poll a health-check command until it succeeds or retries are exhausted."""
+    container = inp.get("container", "")
+    health_command = inp.get("health_command", "")
+    if not container or not health_command:
+        return {"error": "Both 'container' and 'health_command' are required"}
+
+    interval = inp.get("interval", 2)
+    retries = inp.get("retries", 15)
+
+    for attempt in range(1, retries + 1):
+        result = await self.runtime.run(
+            "exec", container, "/bin/sh", "-c", health_command,
+            timeout=interval + 5,
+        )
+        if result.returncode == 0:
+            return {
+                "healthy": True,
+                "container": container,
+                "attempts": attempt,
+                "detail": f"Health check passed on attempt {attempt}/{retries}",
+            }
+        if attempt < retries:
+            await asyncio.sleep(interval)
+
+    return {
+        "healthy": False,
+        "container": container,
+        "attempts": retries,
+        "detail": f"Health check failed after {retries} attempts",
+        "last_error": result.stderr.strip() if result else "",
+    }
+```
+
+Note: This uses `asyncio.sleep` between attempts. `asyncio` is NOT currently imported in `__init__.py` — add `import asyncio` to the imports block at the top of the file (alongside the other stdlib imports like `os`, `json`, `shutil`).
+
+**Usage pattern** (for the agent/docs):
+```
+containers(create, name="my-db", image="postgres:16",
+           env={"POSTGRES_PASSWORD": "dev"}, network="my-stack")
+containers(wait_healthy, container="my-db",
+           health_command="pg_isready -U postgres",
+           interval=2, retries=15)
+containers(create, name="my-app", purpose="python", network="my-stack",
+           env={"DATABASE_URL": "postgresql://postgres:dev@my-db:5432/app"})
+```
+
+**Tests** (in `tests/unit/test_tool.py`):
+
+```python
+@pytest.mark.asyncio
+async def test_wait_healthy_succeeds_first_attempt(tool):
+    """wait_healthy returns healthy=True when check passes immediately."""
+    async def _mock_run(*args, **kwargs):
+        from amplifier_module_tool_containers.runtime import CommandResult
+        return CommandResult(returncode=0, stdout="ready", stderr="")
+    tool.runtime.run = _mock_run
+    result = await tool.execute("containers", {
+        "operation": "wait_healthy",
+        "container": "test-db",
+        "health_command": "pg_isready",
+    })
+    assert result["healthy"] is True
+    assert result["attempts"] == 1
+
+@pytest.mark.asyncio
+async def test_wait_healthy_succeeds_after_retries(tool):
+    """wait_healthy returns healthy=True after some failed attempts."""
+    call_count = 0
+    async def _mock_run(*args, **kwargs):
+        nonlocal call_count
+        from amplifier_module_tool_containers.runtime import CommandResult
+        call_count += 1
+        if call_count < 3:
+            return CommandResult(returncode=1, stdout="", stderr="not ready")
+        return CommandResult(returncode=0, stdout="ready", stderr="")
+    tool.runtime.run = _mock_run
+    result = await tool.execute("containers", {
+        "operation": "wait_healthy",
+        "container": "test-db",
+        "health_command": "pg_isready",
+        "interval": 0,  # No sleep in tests
+    })
+    assert result["healthy"] is True
+    assert result["attempts"] == 3
+
+@pytest.mark.asyncio
+async def test_wait_healthy_exhausts_retries(tool):
+    """wait_healthy returns healthy=False when all retries fail."""
+    async def _mock_run(*args, **kwargs):
+        from amplifier_module_tool_containers.runtime import CommandResult
+        return CommandResult(returncode=1, stdout="", stderr="connection refused")
+    tool.runtime.run = _mock_run
+    result = await tool.execute("containers", {
+        "operation": "wait_healthy",
+        "container": "test-db",
+        "health_command": "pg_isready",
+        "interval": 0,
+        "retries": 3,
+    })
+    assert result["healthy"] is False
+    assert result["attempts"] == 3
+    assert "connection refused" in result["last_error"]
+
+@pytest.mark.asyncio
+async def test_wait_healthy_requires_params(tool):
+    """wait_healthy returns error if container or health_command missing."""
+    result = await tool.execute("containers", {
+        "operation": "wait_healthy",
+        "container": "test-db",
+    })
+    assert "error" in result
+
+def test_wait_healthy_in_schema():
+    """wait_healthy is in the operation enum."""
+    from amplifier_module_tool_containers import ContainersTool
+    t = ContainersTool()
+    schema = t.tool_definitions[0]["input_schema"]
+    ops = schema["properties"]["operation"]["enum"]
+    assert "wait_healthy" in ops
+```
+
+**Done when**: `containers(wait_healthy, container="my-db", health_command="pg_isready")` polls until the health check passes or retries are exhausted. All existing + new tests pass.
+
+---
+
+### Task 4.3: Compose-File Interpretation Pattern (Documentation)
+
+**What**: Add a documented pattern to the context docs showing how the agent should parse a docker-compose.yml and translate it into create + create_network + wait_healthy calls. This is documentation only — no code changes.
+
+**Files to modify**:
+- `context/container-guide.md` — Add a new "Interpreting docker-compose.yml" section
+- `context/container-awareness.md` — Add wait_healthy to operations table and add brief compose interpretation note
+- `agents/container-operator.md` — Add compose interpretation to operating principles
+
+**`container-guide.md` new section** (add after the Multi-Container Patterns section):
+
+```markdown
+## Interpreting docker-compose.yml Files
+
+When a user has a docker-compose.yml and wants to use it, DON'T suggest `docker compose up`. Instead, read the file and translate it into container tool calls. This preserves our full provisioning pipeline (credentials, dotfiles, user mapping, tracking).
+
+### Translation Pattern
+
+Given a docker-compose.yml like:
+```yaml
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: dev
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+  redis:
+    image: redis:7
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:dev@db:5432/app
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "8000:8000"
+```
+
+Translate to:
+```
+containers(create_network, name="project-stack")
+
+containers(create, name="db", image="postgres:16",
+           env={"POSTGRES_PASSWORD": "dev"},
+           ports=[{"host": 5432, "container": 5432}],
+           network="project-stack")
+
+containers(wait_healthy, container="db",
+           health_command="pg_isready -U postgres",
+           interval=2, retries=15)
+
+containers(create, name="redis", image="redis:7",
+           network="project-stack")
+
+containers(create, name="app", purpose="python",
+           network="project-stack",
+           env={"DATABASE_URL": "postgresql://postgres:dev@db:5432/app",
+                "REDIS_URL": "redis://redis:6379"},
+           ports=[{"host": 8000, "container": 8000}])
+```
+
+### Translation Rules
+
+| Compose Feature | Translation |
+|----------------|-------------|
+| `image:` | `image` parameter on create |
+| `environment:` | `env` parameter on create |
+| `ports:` | `ports` parameter on create |
+| `volumes:` (bind mounts) | `mounts` parameter on create |
+| `networks:` | `create_network` + `network` parameter |
+| `depends_on: condition: service_healthy` | `wait_healthy` between creates |
+| `depends_on:` (basic) | Order your create calls correctly |
+| `healthcheck: test:` | `health_command` for wait_healthy |
+| `build:` | Not supported — ask user to build image first, then use the image |
+| `restart:` | Not applicable — ephemeral containers |
+| `env_file:` | Read the .env file, merge into `env` parameter |
+
+### When NOT to translate
+
+If the compose file is very complex (10+ services, custom build contexts, init containers, tmpfs mounts, custom network drivers), tell the user they should use `docker compose` directly via bash. Our tool is for provisioned, managed containers — not for running arbitrary compose stacks.
+```
+
+**`container-awareness.md` updates**:
+- Add `wait_healthy` to the operations table:
+  ```
+  | `wait_healthy` | Poll health-check command until service is ready |
+  ```
+- Add brief note in patterns section about compose interpretation:
+  ```
+  When a user has a docker-compose.yml, read the YAML and translate services
+  into create + create_network + wait_healthy calls. See container-guide.md
+  for the full translation pattern.
+  ```
+
+**`agents/container-operator.md` updates**:
+- Add to operating principles:
+  ```
+  ### Compose File Interpretation
+  When a user has a docker-compose.yml, read the file and translate it into
+  tool calls rather than suggesting `docker compose up`. This preserves
+  credential forwarding, user mapping, and container tracking. Use
+  `wait_healthy` for health-check-based startup ordering. See the
+  "Interpreting docker-compose.yml" section in the container guide.
+  ```
+
+**Tests**: N/A (documentation only)
+
+**Done when**: All context docs include wait_healthy in operations references, and the compose interpretation pattern is documented for the agent.
 
 ---
 
@@ -1663,5 +1929,4 @@ pytest tests/ -v -m "not integration"
 - Phase 1: 43 unit + 11 integration = 54 tests
 - Phase 2: +49 tests = 103 total (87 unit + 16 integration)
 - Phase 3: +20 tests = 123 total (107 unit + 16 integration)
-- Phase 4 target: ~5 additional tests
-- Total target: ~128 tests
+- Phase 4: +5 (GPU) + ~5 (wait_healthy) = ~133 total
