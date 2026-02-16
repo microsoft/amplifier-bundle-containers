@@ -636,7 +636,7 @@ class ContainersTool:
 
         # Image + command
         args.append(image)
-        args.extend(["sleep", "infinity"])
+        args.extend(["tail", "-f", "/dev/null"])
 
         # Create the container
         result = await self.runtime.run(*args, timeout=120)
@@ -648,186 +648,210 @@ class ContainersTool:
 
         container_id = result.stdout.strip()[:12]
 
-        # Create user matching host UID:GID inside the container
-        if exec_user:
-            uid, gid = exec_user.split(":")
-            user_cmds = [
-                f"groupadd -g {gid} -o hostuser 2>/dev/null || true",
-                f"useradd -u {uid} -g {gid} -m -s /bin/bash -o hostuser 2>/dev/null || true",
-            ]
-            for cmd in user_cmds:
-                await self.runtime.run("exec", name, "/bin/sh", "-c", cmd, timeout=30)
+        try:
+            # Create user matching host UID:GID inside the container
+            if exec_user:
+                uid, gid = exec_user.split(":")
+                user_cmds = [
+                    f"groupadd -g {gid} -o hostuser 2>/dev/null || true",
+                    f"useradd -u {uid} -g {gid} -m -s /bin/bash -o hostuser 2>/dev/null || true",
+                ]
+                for cmd in user_cmds:
+                    await self.runtime.run("exec", name, "/bin/sh", "-c", cmd, timeout=30)
 
-        # Determine target home for provisioning
-        target_home = "/home/hostuser" if exec_user else None
+            # Determine target home for provisioning
+            target_home = "/home/hostuser" if exec_user else None
 
-        # Collect provisioning report
-        report: list[ProvisioningStep] = []
+            # Collect provisioning report
+            report: list[ProvisioningStep] = []
 
-        # Env passthrough (already done via -e flags, just report it)
-        report.append(
-            ProvisioningStep("env_passthrough", "success", f"{len(env_vars)} variables injected")
-        )
-
-        # Git config
-        if inp.get("forward_git", True):
-            report.append(await self.provisioner.provision_git(name, target_home=target_home))
-        else:
-            report.append(ProvisioningStep("forward_git", "skipped", "Not requested"))
-
-        # GH auth
-        if inp.get("forward_gh", True):
-            report.append(await self.provisioner.provision_gh_auth(name, target_home=target_home))
-        else:
-            report.append(ProvisioningStep("forward_gh", "skipped", "Not requested"))
-
-        # SSH permissions
-        if inp.get("forward_ssh", False):
-            report.append(await self.provisioner.fix_ssh_permissions(name, target_home=target_home))
-        else:
-            report.append(ProvisioningStep("forward_ssh", "skipped", "Not requested"))
-
-        # Dotfiles
-        if not inp.get("dotfiles_skip", False):
-            dotfiles_repo = inp.get(
-                "dotfiles_repo",
-                self.config.get("dotfiles", {}).get("repo"),
-            )
-            if dotfiles_repo:
-                report.append(
-                    await self.provisioner.provision_dotfiles(
-                        name,
-                        repo=dotfiles_repo,
-                        script=inp.get("dotfiles_script"),
-                        branch=inp.get("dotfiles_branch"),
-                        target=inp.get("dotfiles_target", "~/.dotfiles"),
-                    )
-                )
-            elif inp.get("dotfiles_inline"):
-                report.append(
-                    await self.provisioner.provision_dotfiles_inline(name, inp["dotfiles_inline"])
-                )
-            else:
-                report.append(ProvisioningStep("dotfiles", "skipped", "No dotfiles configured"))
-        else:
-            report.append(ProvisioningStep("dotfiles", "skipped", "Explicitly skipped"))
-
-        # Amplifier settings forwarding (only for amplifier purpose)
-        if purpose == "amplifier":
-            report.append(
-                await self.provisioner.provision_amplifier_settings(name, target_home=target_home)
-            )
-
-        # Amplifier version pinning (only for amplifier purpose)
-        if purpose == "amplifier" and inp.get("amplifier_version"):
-            version = inp["amplifier_version"]
-            # Replace the generic install with versioned
-            inp["setup_commands"] = [
-                cmd.replace(
-                    "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install amplifier",
-                    f"UV_TOOL_BIN_DIR=/usr/local/bin uv tool install amplifier=={version}",
-                )
-                if "uv tool install amplifier" in cmd
-                else cmd
-                for cmd in inp.get("setup_commands", [])
-            ]
-
-        # Amplifier bundle configuration (only for amplifier purpose)
-        if purpose == "amplifier" and inp.get("amplifier_bundle"):
-            bundle_uri = inp["amplifier_bundle"]
-            inp.setdefault("setup_commands", [])
-            inp["setup_commands"].append(
-                f"amplifier bundle add {bundle_uri} --app 2>/dev/null || true"
-            )
-
-        # Setup commands (track each individually)
-        setup_commands = inp.get("setup_commands", [])
-        if setup_commands:
-            cmd_results = []
-            for cmd in setup_commands:
-                cmd_result = await self.runtime.run("exec", name, "/bin/sh", "-c", cmd, timeout=300)
-                if cmd_result.returncode != 0:
-                    cmd_results.append(
-                        {"command": cmd, "status": "failed", "error": cmd_result.stderr.strip()}
-                    )
-                else:
-                    cmd_results.append({"command": cmd, "status": "success"})
-
-            all_ok = all(r["status"] == "success" for r in cmd_results)
-            succeeded = sum(1 for r in cmd_results if r["status"] == "success")
+            # Env passthrough (already done via -e flags, just report it)
             report.append(
                 ProvisioningStep(
-                    "setup_commands",
-                    "success" if all_ok else "partial",
-                    f"{succeeded}/{len(cmd_results)} commands succeeded",
-                    error=None
-                    if all_ok
-                    else str([r for r in cmd_results if r["status"] == "failed"]),
+                    "env_passthrough", "success", f"{len(env_vars)} variables injected"
                 )
             )
 
-        # Fix workspace ownership for the mapped user
-        if exec_user:
-            await self.runtime.run(
-                "exec",
+            # Git config
+            if inp.get("forward_git", True):
+                report.append(await self.provisioner.provision_git(name, target_home=target_home))
+            else:
+                report.append(ProvisioningStep("forward_git", "skipped", "Not requested"))
+
+            # GH auth
+            if inp.get("forward_gh", True):
+                report.append(
+                    await self.provisioner.provision_gh_auth(name, target_home=target_home)
+                )
+            else:
+                report.append(ProvisioningStep("forward_gh", "skipped", "Not requested"))
+
+            # SSH permissions
+            if inp.get("forward_ssh", False):
+                report.append(
+                    await self.provisioner.fix_ssh_permissions(name, target_home=target_home)
+                )
+            else:
+                report.append(ProvisioningStep("forward_ssh", "skipped", "Not requested"))
+
+            # Dotfiles
+            if not inp.get("dotfiles_skip", False):
+                dotfiles_repo = inp.get(
+                    "dotfiles_repo",
+                    self.config.get("dotfiles", {}).get("repo"),
+                )
+                if dotfiles_repo:
+                    report.append(
+                        await self.provisioner.provision_dotfiles(
+                            name,
+                            repo=dotfiles_repo,
+                            script=inp.get("dotfiles_script"),
+                            branch=inp.get("dotfiles_branch"),
+                            target=inp.get("dotfiles_target", "~/.dotfiles"),
+                        )
+                    )
+                elif inp.get("dotfiles_inline"):
+                    report.append(
+                        await self.provisioner.provision_dotfiles_inline(
+                            name, inp["dotfiles_inline"]
+                        )
+                    )
+                else:
+                    report.append(ProvisioningStep("dotfiles", "skipped", "No dotfiles configured"))
+            else:
+                report.append(ProvisioningStep("dotfiles", "skipped", "Explicitly skipped"))
+
+            # Amplifier settings forwarding (only for amplifier purpose)
+            if purpose == "amplifier":
+                report.append(
+                    await self.provisioner.provision_amplifier_settings(
+                        name, target_home=target_home
+                    )
+                )
+
+            # Amplifier version pinning (only for amplifier purpose)
+            if purpose == "amplifier" and inp.get("amplifier_version"):
+                version = inp["amplifier_version"]
+                # Replace the generic install with versioned
+                inp["setup_commands"] = [
+                    cmd.replace(
+                        "UV_TOOL_BIN_DIR=/usr/local/bin uv tool install amplifier",
+                        f"UV_TOOL_BIN_DIR=/usr/local/bin uv tool install amplifier=={version}",
+                    )
+                    if "uv tool install amplifier" in cmd
+                    else cmd
+                    for cmd in inp.get("setup_commands", [])
+                ]
+
+            # Amplifier bundle configuration (only for amplifier purpose)
+            if purpose == "amplifier" and inp.get("amplifier_bundle"):
+                bundle_uri = inp["amplifier_bundle"]
+                inp.setdefault("setup_commands", [])
+                inp["setup_commands"].append(
+                    f"amplifier bundle add {bundle_uri} --app 2>/dev/null || true"
+                )
+
+            # Setup commands (track each individually)
+            setup_commands = inp.get("setup_commands", [])
+            if setup_commands:
+                cmd_results = []
+                for cmd in setup_commands:
+                    cmd_result = await self.runtime.run(
+                        "exec", name, "/bin/sh", "-c", cmd, timeout=300
+                    )
+                    if cmd_result.returncode != 0:
+                        cmd_results.append(
+                            {"command": cmd, "status": "failed", "error": cmd_result.stderr.strip()}
+                        )
+                    else:
+                        cmd_results.append({"command": cmd, "status": "success"})
+
+                all_ok = all(r["status"] == "success" for r in cmd_results)
+                succeeded = sum(1 for r in cmd_results if r["status"] == "success")
+                report.append(
+                    ProvisioningStep(
+                        "setup_commands",
+                        "success" if all_ok else "partial",
+                        f"{succeeded}/{len(cmd_results)} commands succeeded",
+                        error=None
+                        if all_ok
+                        else str([r for r in cmd_results if r["status"] == "failed"]),
+                    )
+                )
+
+            # Fix workspace ownership for the mapped user
+            if exec_user:
+                await self.runtime.run(
+                    "exec",
+                    name,
+                    "/bin/sh",
+                    "-c",
+                    f"chown -R {exec_user} /workspace 2>/dev/null || true",
+                    timeout=60,
+                )
+
+            # Save metadata
+            self.store.save(
                 name,
-                "/bin/sh",
-                "-c",
-                f"chown -R {exec_user} /workspace 2>/dev/null || true",
-                timeout=60,
+                {
+                    "name": name,
+                    "container_id": container_id,
+                    "image": image,
+                    "purpose": purpose,
+                    "created": now,
+                    "persistent": inp.get("persistent", False),
+                    "mounts": inp.get("mounts", []),
+                    "mount_cwd": inp.get("mount_cwd", True),
+                    "ports": inp.get("ports", []),
+                    "env_keys": list(env_vars.keys()),
+                    "exec_user": exec_user,
+                    "provisioning": {
+                        "forward_git": inp.get("forward_git", True),
+                        "forward_gh": inp.get("forward_gh", True),
+                        "forward_ssh": inp.get("forward_ssh", False),
+                        "dotfiles_repo": inp.get("dotfiles_repo"),
+                    },
+                },
             )
 
-        # Save metadata
-        self.store.save(
-            name,
-            {
-                "name": name,
+            # Cache the image for next time (only for purpose-based creates without cache)
+            if purpose and not cache_used and not inp.get("cache_bust", False):
+                await self._cache_image(name, purpose)
+
+            # Get interactive hint
+            runtime_name = await self.runtime.detect()
+            if exec_user:
+                hint = f"{runtime_name} exec -it --user {exec_user} {name} /bin/bash"
+            else:
+                hint = f"{runtime_name} exec -it {name} /bin/bash"
+
+            return {
+                "success": True,
+                "container": name,
                 "container_id": container_id,
                 "image": image,
                 "purpose": purpose,
-                "created": now,
+                "connect_command": hint,
+                "workdir": workdir,
+                "env_vars_injected": len(env_vars),
                 "persistent": inp.get("persistent", False),
-                "mounts": inp.get("mounts", []),
-                "mount_cwd": inp.get("mount_cwd", True),
-                "ports": inp.get("ports", []),
-                "env_keys": list(env_vars.keys()),
-                "exec_user": exec_user,
-                "provisioning": {
-                    "forward_git": inp.get("forward_git", True),
-                    "forward_gh": inp.get("forward_gh", True),
-                    "forward_ssh": inp.get("forward_ssh", False),
-                    "dotfiles_repo": inp.get("dotfiles_repo"),
-                },
-            },
-        )
+                "cache_used": cache_used,
+                "provisioning_report": [
+                    {"name": s.name, "status": s.status, "detail": s.detail, "error": s.error}
+                    for s in report
+                ],
+            }
 
-        # Cache the image for next time (only for purpose-based creates without cache)
-        if purpose and not cache_used and not inp.get("cache_bust", False):
-            await self._cache_image(name, purpose)
-
-        # Get interactive hint
-        runtime_name = await self.runtime.detect()
-        if exec_user:
-            hint = f"{runtime_name} exec -it --user {exec_user} {name} /bin/bash"
-        else:
-            hint = f"{runtime_name} exec -it {name} /bin/bash"
-
-        return {
-            "success": True,
-            "container": name,
-            "container_id": container_id,
-            "image": image,
-            "purpose": purpose,
-            "connect_command": hint,
-            "workdir": workdir,
-            "env_vars_injected": len(env_vars),
-            "persistent": inp.get("persistent", False),
-            "cache_used": cache_used,
-            "provisioning_report": [
-                {"name": s.name, "status": s.status, "detail": s.detail, "error": s.error}
-                for s in report
-            ],
-        }
+        except Exception as exc:
+            # Cleanup: destroy the container if post-create setup fails
+            await self.runtime.run("rm", "-f", name, timeout=15)
+            self.store.remove(name)
+            return self._wrap_result(
+                {
+                    "error": f"Container created but setup failed: {exc}",
+                    "cleanup": "Container was automatically removed",
+                }
+            )
 
     async def _op_exec(self, inp: dict[str, Any]) -> dict[str, Any]:
         container = inp.get("container", "")
