@@ -553,6 +553,15 @@ class ContainersTool:
         name = inp.get("name") or f"amp-{purpose or 'env'}-{uuid.uuid4().hex[:6]}"
         image = inp.get("image", self.config.get("default_image", "ubuntu:24.04"))
         workdir = inp.get("workdir", "/workspace")
+        # Only set workdir to /workspace if we're actually mounting something there
+        if (
+            workdir == "/workspace"
+            and not inp.get("mount_cwd", True)
+            and not any(
+                m.get("container", "").startswith("/workspace") for m in inp.get("mounts", [])
+            )
+        ):
+            workdir = "/root"  # Safe fallback when no workspace mount
 
         # Build docker run args
         args: list[str] = [
@@ -641,10 +650,14 @@ class ContainersTool:
         # Create the container
         result = await self.runtime.run(*args, timeout=120)
         if result.returncode != 0:
-            return {
-                "error": f"Failed to create container: {result.stderr.strip()}",
-                "command_hint": f"{await self.runtime.detect()} {' '.join(args)}",
-            }
+            # Clean up any dead container left behind by the failed run
+            await self.runtime.run("rm", "-f", name, timeout=10)
+            return self._wrap_result(
+                {
+                    "error": f"Failed to create container: {result.stderr.strip()}",
+                    "command_hint": f"{await self.runtime.detect()} {' '.join(args)}",
+                }
+            )
 
         container_id = result.stdout.strip()[:12]
 
