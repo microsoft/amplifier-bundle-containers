@@ -290,6 +290,119 @@ class ContainerProvisioner:
             "amplifier_settings", "success", f"Copied {', '.join(files_copied)}"
         )
 
+    async def provision_repos(
+        self,
+        container: str,
+        repos: list[dict[str, str]],
+    ) -> ProvisioningStep:
+        """Clone repos into the container and optionally run install commands."""
+        if not repos:
+            return ProvisioningStep("repos", "skipped", "No repos specified")
+
+        cloned: list[str] = []
+        failed: list[dict[str, str]] = []
+        for repo in repos:
+            url = repo.get("url", "")
+            path = repo.get("path", f"/workspace/{url.rstrip('/').split('/')[-1]}")
+            install = repo.get("install")
+
+            # Clone
+            clone_result = await self.runtime.run(
+                "exec",
+                container,
+                "/bin/sh",
+                "-c",
+                f"git clone {url} {path}",
+                timeout=120,
+            )
+            if clone_result.returncode != 0:
+                failed.append({"url": url, "error": clone_result.stderr.strip()})
+                continue
+
+            # Install (optional, runs as root since it's a setup operation)
+            if install:
+                install_result = await self.runtime.run(
+                    "exec",
+                    container,
+                    "/bin/sh",
+                    "-c",
+                    f"cd {path} && {install}",
+                    timeout=300,
+                )
+                if install_result.returncode != 0:
+                    failed.append(
+                        {"url": url, "error": f"Install failed: {install_result.stderr.strip()}"}
+                    )
+                    continue
+
+            cloned.append(url.split("/")[-1])
+
+        if failed and not cloned:
+            return ProvisioningStep(
+                "repos",
+                "failed",
+                f"All {len(failed)} repos failed to clone",
+                error=str(failed),
+            )
+        if failed:
+            return ProvisioningStep(
+                "repos",
+                "partial",
+                f"{len(cloned)}/{len(cloned) + len(failed)} repos cloned",
+                error=str(failed),
+            )
+        return ProvisioningStep(
+            "repos",
+            "success",
+            f"Cloned {len(cloned)} repos: {', '.join(cloned)}",
+        )
+
+    async def provision_config_files(
+        self,
+        container: str,
+        config_files: dict[str, str],
+    ) -> ProvisioningStep:
+        """Write config files to arbitrary paths inside the container."""
+        if not config_files:
+            return ProvisioningStep("config_files", "skipped", "No config files specified")
+
+        written: list[str] = []
+        failed: list[dict[str, str]] = []
+        for path, content in config_files.items():
+            escaped = content.replace("'", "'\\''")
+            result = await self.runtime.run(
+                "exec",
+                container,
+                "/bin/sh",
+                "-c",
+                f"mkdir -p $(dirname '{path}') && cat > '{path}' << 'AMPLIFIER_CONFIG_EOF'\n{escaped}\nAMPLIFIER_CONFIG_EOF",
+                timeout=10,
+            )
+            if result.returncode == 0:
+                written.append(path)
+            else:
+                failed.append({"path": path, "error": result.stderr.strip()})
+
+        if failed and not written:
+            return ProvisioningStep(
+                "config_files",
+                "failed",
+                f"All {len(failed)} files failed",
+                error=str(failed),
+            )
+        if failed:
+            return ProvisioningStep(
+                "config_files",
+                "partial",
+                f"{len(written)}/{len(written) + len(failed)} files written",
+                error=str(failed),
+            )
+        return ProvisioningStep(
+            "config_files",
+            "success",
+            f"Wrote {len(written)} files: {', '.join(written)}",
+        )
+
     async def provision_dotfiles(
         self,
         container: str,

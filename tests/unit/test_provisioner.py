@@ -585,3 +585,236 @@ async def test_fix_ssh_returns_failed_step():
     assert step.name == "forward_ssh"
     assert step.status == "failed"
     assert step.error is not None
+
+
+# ---------------------------------------------------------------------------
+# provision_repos
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_provision_repos_success():
+    """provision_repos clones repos and reports success."""
+    runtime = ContainerRuntime()
+    runtime._runtime = "docker"
+
+    async def _mock_run(*args, **kwargs):
+        return CommandResult(returncode=0, stdout="", stderr="")
+
+    runtime.run = _mock_run  # type: ignore[assignment]
+    provisioner = ContainerProvisioner(runtime)
+
+    result = await provisioner.provision_repos(
+        "test-container",
+        [
+            {"url": "https://github.com/user/repo1", "path": "/workspace/repo1"},
+            {"url": "https://github.com/user/repo2", "path": "/workspace/repo2"},
+        ],
+    )
+    assert result.status == "success"
+    assert "2 repos" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_provision_repos_with_install():
+    """provision_repos runs install command after cloning."""
+    runtime = ContainerRuntime()
+    runtime._runtime = "docker"
+    commands_run: list[tuple[object, ...]] = []
+
+    async def _mock_run(*args, **kwargs):
+        commands_run.append(args)
+        return CommandResult(returncode=0, stdout="", stderr="")
+
+    runtime.run = _mock_run  # type: ignore[assignment]
+    provisioner = ContainerProvisioner(runtime)
+
+    result = await provisioner.provision_repos(
+        "test-container",
+        [
+            {
+                "url": "https://github.com/user/repo1",
+                "path": "/workspace/repo1",
+                "install": "pip install -e .",
+            },
+        ],
+    )
+    assert result.status == "success"
+    # Should have both clone and install commands
+    assert len(commands_run) == 2
+
+
+@pytest.mark.asyncio
+async def test_provision_repos_clone_failure():
+    """provision_repos reports partial when one repo fails."""
+    runtime = ContainerRuntime()
+    runtime._runtime = "docker"
+    call_count = 0
+
+    async def _mock_run(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:  # First clone succeeds
+            return CommandResult(returncode=0, stdout="", stderr="")
+        return CommandResult(returncode=1, stdout="", stderr="fatal: not found")  # Second fails
+
+    runtime.run = _mock_run  # type: ignore[assignment]
+    provisioner = ContainerProvisioner(runtime)
+
+    result = await provisioner.provision_repos(
+        "test-container",
+        [
+            {"url": "https://github.com/user/repo1"},
+            {"url": "https://github.com/user/repo2"},
+        ],
+    )
+    assert result.status == "partial"
+    assert "1/2" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_provision_repos_all_fail():
+    """provision_repos reports failed when all repos fail."""
+    runtime = ContainerRuntime()
+    runtime._runtime = "docker"
+
+    async def _mock_run(*args, **kwargs):
+        return CommandResult(returncode=1, stdout="", stderr="fatal: not found")
+
+    runtime.run = _mock_run  # type: ignore[assignment]
+    provisioner = ContainerProvisioner(runtime)
+
+    result = await provisioner.provision_repos(
+        "test-container",
+        [
+            {"url": "https://github.com/user/repo1"},
+        ],
+    )
+    assert result.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_provision_repos_empty():
+    """provision_repos returns skipped for empty list."""
+    runtime = ContainerRuntime()
+    runtime._runtime = "docker"
+    provisioner = ContainerProvisioner(runtime)
+    result = await provisioner.provision_repos("test-container", [])
+    assert result.status == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_provision_repos_default_path():
+    """provision_repos uses /workspace/{name} when path not specified."""
+    runtime = ContainerRuntime()
+    runtime._runtime = "docker"
+    clone_cmd = ""
+
+    async def _mock_run(*args, **kwargs):
+        nonlocal clone_cmd
+        for a in args:
+            if isinstance(a, str) and "git clone" in a:
+                clone_cmd = a
+        return CommandResult(returncode=0, stdout="", stderr="")
+
+    runtime.run = _mock_run  # type: ignore[assignment]
+    provisioner = ContainerProvisioner(runtime)
+
+    await provisioner.provision_repos(
+        "test-container",
+        [
+            {"url": "https://github.com/user/my-repo"},
+        ],
+    )
+    assert "/workspace/my-repo" in clone_cmd
+
+
+# ---------------------------------------------------------------------------
+# provision_config_files
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_provision_config_files_success():
+    """provision_config_files writes files and reports success."""
+    runtime = ContainerRuntime()
+    runtime._runtime = "docker"
+
+    async def _mock_run(*args, **kwargs):
+        return CommandResult(returncode=0, stdout="", stderr="")
+
+    runtime.run = _mock_run  # type: ignore[assignment]
+    provisioner = ContainerProvisioner(runtime)
+
+    result = await provisioner.provision_config_files(
+        "test-container",
+        {
+            "/workspace/.storage.yaml": "provider: git\n",
+            "/workspace/.config.yaml": "debug: true\n",
+        },
+    )
+    assert result.status == "success"
+    assert "2 files" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_provision_config_files_failure():
+    """provision_config_files reports partial on failure."""
+    runtime = ContainerRuntime()
+    runtime._runtime = "docker"
+    call_count = 0
+
+    async def _mock_run(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return CommandResult(returncode=0, stdout="", stderr="")
+        return CommandResult(returncode=1, stdout="", stderr="permission denied")
+
+    runtime.run = _mock_run  # type: ignore[assignment]
+    provisioner = ContainerProvisioner(runtime)
+
+    result = await provisioner.provision_config_files(
+        "test-container",
+        {
+            "/workspace/a.yaml": "a\n",
+            "/root/b.yaml": "b\n",
+        },
+    )
+    assert result.status == "partial"
+
+
+@pytest.mark.asyncio
+async def test_provision_config_files_empty():
+    """provision_config_files returns skipped for empty dict."""
+    runtime = ContainerRuntime()
+    runtime._runtime = "docker"
+    provisioner = ContainerProvisioner(runtime)
+    result = await provisioner.provision_config_files("test-container", {})
+    assert result.status == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_provision_config_files_creates_dirs():
+    """provision_config_files creates parent directories."""
+    runtime = ContainerRuntime()
+    runtime._runtime = "docker"
+    cmd_run = ""
+
+    async def _mock_run(*args, **kwargs):
+        nonlocal cmd_run
+        for a in args:
+            if isinstance(a, str) and "mkdir" in a:
+                cmd_run = a
+        return CommandResult(returncode=0, stdout="", stderr="")
+
+    runtime.run = _mock_run  # type: ignore[assignment]
+    provisioner = ContainerProvisioner(runtime)
+
+    await provisioner.provision_config_files(
+        "test-container",
+        {
+            "/workspace/deep/nested/config.yaml": "test\n",
+        },
+    )
+    assert "mkdir -p" in cmd_run

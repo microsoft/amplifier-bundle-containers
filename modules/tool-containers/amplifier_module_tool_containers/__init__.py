@@ -229,6 +229,29 @@ class ContainersTool:
                         "dotfiles_target": {"type": "string"},
                         "dotfiles_inline": {"type": "object"},
                         "dotfiles_skip": {"type": "boolean"},
+                        "repos": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "url": {"type": "string", "description": "Git URL to clone"},
+                                    "path": {
+                                        "type": "string",
+                                        "description": "Clone destination (default: /workspace/{repo-name})",
+                                    },
+                                    "install": {
+                                        "type": "string",
+                                        "description": "Optional install command (e.g., 'pip install -e .')",
+                                    },
+                                },
+                                "required": ["url"],
+                            },
+                            "description": "Repos to clone into the container",
+                        },
+                        "config_files": {
+                            "type": "object",
+                            "description": "Files to write: {'/path/in/container': 'file content'}",
+                        },
                         "setup_commands": {
                             "type": "array",
                             "items": {"type": "string"},
@@ -733,6 +756,24 @@ class ContainersTool:
                     report.append(ProvisioningStep("dotfiles", "skipped", "No dotfiles configured"))
             else:
                 report.append(ProvisioningStep("dotfiles", "skipped", "Explicitly skipped"))
+
+            # Clone repos
+            repos_list = inp.get("repos", [])
+            if repos_list:
+                report.append(await self.provisioner.provision_repos(name, repos_list))
+            else:
+                report.append(ProvisioningStep("repos", "skipped", "No repos specified"))
+
+            # Write config files
+            config_files_dict = inp.get("config_files", {})
+            if config_files_dict:
+                report.append(
+                    await self.provisioner.provision_config_files(name, config_files_dict)
+                )
+            else:
+                report.append(
+                    ProvisioningStep("config_files", "skipped", "No config files specified")
+                )
 
             # Amplifier settings forwarding (only for amplifier purpose)
             if purpose == "amplifier":

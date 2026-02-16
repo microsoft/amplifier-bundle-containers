@@ -1287,3 +1287,22 @@ def test_wait_healthy_in_schema():
     schema = t.tool_definitions[0]["input_schema"]
     ops = schema["properties"]["operation"]["enum"]
     assert "wait_healthy" in ops
+
+
+# ---------------------------------------------------------------------------
+# repos / config_files schema
+# ---------------------------------------------------------------------------
+
+
+def test_repos_in_schema():
+    """repos parameter is in the tool schema."""
+    t = ContainersTool()
+    schema = t.tool_definitions[0]["input_schema"]
+    assert "repos" in schema["properties"]
+
+
+def test_config_files_in_schema():
+    """config_files parameter is in the tool schema."""
+    t = ContainersTool()
+    schema = t.tool_definitions[0]["input_schema"]
+    assert "config_files" in schema["properties"]
