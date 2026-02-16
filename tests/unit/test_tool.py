@@ -1306,3 +1306,186 @@ def test_config_files_in_schema():
     t = ContainersTool()
     schema = t.tool_definitions[0]["input_schema"]
     assert "config_files" in schema["properties"]
+
+
+# ---------------------------------------------------------------------------
+# Compose integration
+# ---------------------------------------------------------------------------
+
+
+def test_compose_content_in_schema():
+    """compose_content is in the tool schema."""
+    t = ContainersTool()
+    schema = t.tool_definitions[0]["input_schema"]
+    assert "compose_content" in schema["properties"]
+
+
+def test_compose_file_in_schema():
+    """compose_file is in the tool schema."""
+    t = ContainersTool()
+    schema = t.tool_definitions[0]["input_schema"]
+    assert "compose_file" in schema["properties"]
+
+
+@pytest.mark.asyncio
+async def test_create_compose_content_and_file_error(tool: ContainersTool):
+    """Providing both compose_content and compose_file returns error."""
+    tool._preflight_passed = True
+    result = await tool.execute(
+        {
+            "operation": "create",
+            "name": "test-both",
+            "compose_content": "services:\n  db:\n    image: postgres\n",
+            "compose_file": "/tmp/compose.yml",
+        },
+    )
+    assert "error" in result
+    assert "not both" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_create_with_compose_content(tool: ContainersTool):
+    """compose_content triggers compose up and joins the compose network."""
+    tool._preflight_passed = True
+    commands_run: list[list[str]] = []
+
+    async def _mock_run(*args: str, **kwargs: object) -> CommandResult:
+        commands_run.append(list(args))
+        # Handle compose version check
+        if "compose" in args and "version" in args:
+            return CommandResult(returncode=0, stdout="v2.24.0", stderr="")
+        # Handle compose up
+        if "compose" in args and "up" in args:
+            return CommandResult(returncode=0, stdout="", stderr="")
+        # Handle network inspect
+        if "network" in args and "inspect" in args:
+            return CommandResult(returncode=0, stdout="[{}]", stderr="")
+        # Handle compose ps
+        if "compose" in args and "ps" in args:
+            return CommandResult(
+                returncode=0,
+                stdout='[{"Service":"db","State":"running"}]',
+                stderr="",
+            )
+        # Default success for everything else (run, exec, etc.)
+        return CommandResult(returncode=0, stdout="container123\n", stderr="")
+
+    tool.runtime.run = _mock_run  # type: ignore[assignment]
+    tool.provisioner.runtime.run = _mock_run  # type: ignore[assignment]
+
+    with (
+        patch("amplifier_module_tool_containers.provisioner.shutil.which", return_value=None),
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        mock_home = mock_path.home.return_value
+        no_file = type(
+            "FP",
+            (),
+            {"exists": lambda self: False, "__str__": lambda self: "/fake/.gitconfig"},
+        )()
+        mock_home.__truediv__ = lambda self, key: no_file
+
+        result = await tool.execute(
+            {
+                "operation": "create",
+                "name": "test-compose",
+                "compose_content": "services:\n  db:\n    image: postgres\n",
+                "mount_cwd": False,
+                "forward_git": False,
+                "forward_gh": False,
+                "forward_ssh": False,
+                "dotfiles_skip": True,
+            },
+        )
+
+    assert result.get("success") or "error" not in result, f"Create failed: {result}"
+    # Verify compose was involved
+    compose_calls = [c for c in commands_run if "compose" in c]
+    assert len(compose_calls) >= 2  # version check + up
+
+
+@pytest.mark.asyncio
+async def test_destroy_with_compose(tool: ContainersTool):
+    """destroy runs compose down when container has compose_project in metadata."""
+    # Set up metadata with compose project
+    tool.store.save(
+        "test-compose-destroy",
+        {
+            "name": "test-compose-destroy",
+            "compose_project": "test-compose-destroy",
+            "compose_file": "/tmp/amp-compose-test.yml",
+        },
+    )
+
+    commands_run: list[list[str]] = []
+
+    async def _mock_run(*args: str, **kwargs: object) -> CommandResult:
+        commands_run.append(list(args))
+        return CommandResult(returncode=0, stdout="", stderr="")
+
+    tool.runtime.run = _mock_run  # type: ignore[assignment]
+
+    await tool.execute(
+        {
+            "operation": "destroy",
+            "container": "test-compose-destroy",
+            "force": True,
+        },
+    )
+
+    # Verify compose down was called
+    compose_down_calls = [c for c in commands_run if "compose" in c and "down" in c]
+    assert len(compose_down_calls) >= 1
+
+
+@pytest.mark.asyncio
+async def test_status_includes_compose_services(tool: ContainersTool):
+    """status includes compose_services when compose_project is in metadata."""
+    tool.store.save(
+        "test-compose-status",
+        {
+            "name": "test-compose-status",
+            "compose_project": "test-compose-status",
+        },
+    )
+
+    async def _mock_run(*args: str, **kwargs: object) -> CommandResult:
+        # Handle container inspect (for status)
+        if "inspect" in args and "--format" in args:
+            import json as _json
+
+            return CommandResult(
+                returncode=0,
+                stdout=_json.dumps(
+                    [
+                        {
+                            "State": {
+                                "Running": True,
+                                "Status": "running",
+                                "StartedAt": "2026-01-01T00:00:00Z",
+                            },
+                            "Config": {"Image": "ubuntu"},
+                        }
+                    ]
+                ),
+                stderr="",
+            )
+        # Handle compose ps
+        if "compose" in args and "ps" in args:
+            return CommandResult(
+                returncode=0,
+                stdout='[{"Service":"db","State":"running"}]',
+                stderr="",
+            )
+        return CommandResult(returncode=0, stdout="", stderr="")
+
+    tool.runtime.run = _mock_run  # type: ignore[assignment]
+
+    result = await tool.execute(
+        {
+            "operation": "status",
+            "container": "test-compose-status",
+        },
+    )
+    assert "compose_services" in result
+    assert len(result["compose_services"]) == 1

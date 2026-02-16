@@ -301,6 +301,14 @@ class ContainersTool:
                             "default": 15,
                             "description": "Maximum number of health check attempts before timeout",
                         },
+                        "compose_content": {
+                            "type": "string",
+                            "description": "Docker Compose YAML content (LLM writes this naturally for multi-service setups)",
+                        },
+                        "compose_file": {
+                            "type": "string",
+                            "description": "Path to existing docker-compose.yml on the host",
+                        },
                         "cache_bust": {
                             "type": "boolean",
                             "default": False,
@@ -530,6 +538,68 @@ class ContainersTool:
         }
 
     async def _op_create(self, inp: dict[str, Any]) -> dict[str, Any]:
+        # Handle compose
+        compose_content = inp.get("compose_content")
+        compose_file_path: str | None = inp.get("compose_file")
+        compose_project: str | None = None
+        compose_network: str | None = None
+
+        if compose_content and compose_file_path:
+            return self._wrap_result({"error": "Provide compose_content OR compose_file, not both"})
+
+        if compose_content or compose_file_path:
+            from .compose import ComposeManager
+
+            compose_mgr = ComposeManager(self.runtime)
+
+            # Check compose is available
+            if not await compose_mgr.detect_compose():
+                return self._wrap_result(
+                    {"error": "docker compose not available. Install the compose plugin."}
+                )
+
+            # We need a name for the compose project; resolve early
+            import uuid as _compose_uuid
+
+            compose_project = inp.get("name") or (
+                f"amp-{inp.get('purpose', 'env')}-{_compose_uuid.uuid4().hex[:6]}"
+            )
+            assert isinstance(compose_project, str)
+            # Ensure inp["name"] is set so the rest of create uses the same name
+            inp.setdefault("name", compose_project)
+
+            if compose_content:
+                # Write compose content to a temp file on the HOST
+                import tempfile
+
+                compose_tmp = tempfile.NamedTemporaryFile(
+                    mode="w",
+                    suffix=".yml",
+                    prefix=f"amp-compose-{compose_project}-",
+                    delete=False,
+                )
+                compose_tmp.write(compose_content)
+                compose_tmp.close()
+                compose_file_path = compose_tmp.name
+
+            assert compose_file_path is not None  # guaranteed by if-branch above
+
+            # Run compose up
+            compose_result = await compose_mgr.up(compose_file_path, compose_project)
+            if not compose_result.success:
+                # Clean up temp file if we created one
+                if compose_content:
+                    try:
+                        os.unlink(compose_file_path)
+                    except OSError:
+                        pass
+                return self._wrap_result(
+                    {"error": f"docker compose up failed: {compose_result.stderr.strip()}"}
+                )
+
+            # Get the compose network so our primary container can join it
+            compose_network = await compose_mgr.get_network_name(compose_project)
+
         # Handle try-repo auto-detection
         purpose = inp.get("purpose")
         if purpose == "try-repo":
@@ -613,6 +683,9 @@ class ContainersTool:
 
         # Network
         network = inp.get("network", "bridge")
+        # If compose created a network, join it instead of the default
+        if compose_network:
+            network = compose_network
         args.extend(["--network", network])
 
         # Mounts
@@ -844,6 +917,21 @@ class ContainersTool:
                     timeout=60,
                 )
 
+            # Report compose services
+            if compose_project:
+                from .compose import ComposeManager
+
+                compose_mgr = ComposeManager(self.runtime)
+                compose_services = await compose_mgr.ps(compose_project)
+                service_names = [s.get("Service", s.get("Name", "?")) for s in compose_services]
+                report.append(
+                    ProvisioningStep(
+                        "compose",
+                        "success",
+                        f"Started {len(compose_services)} services: {', '.join(service_names)}",
+                    )
+                )
+
             # Save metadata
             self.store.save(
                 name,
@@ -859,6 +947,9 @@ class ContainersTool:
                     "ports": inp.get("ports", []),
                     "env_keys": list(env_vars.keys()),
                     "exec_user": exec_user,
+                    "compose_project": compose_project,
+                    "compose_file": compose_file_path,
+                    "compose_network": compose_network,
                     "provisioning": {
                         "forward_git": inp.get("forward_git", True),
                         "forward_gh": inp.get("forward_gh", True),
@@ -1002,14 +1093,25 @@ class ContainersTool:
             if isinstance(info, list):
                 info = info[0]
             state = info.get("State", {})
-            return {
+            metadata = self.store.load(container)
+            status_result: dict[str, Any] = {
                 "container": container,
                 "running": state.get("Running", False),
                 "status": state.get("Status", "unknown"),
                 "started_at": state.get("StartedAt"),
                 "image": info.get("Config", {}).get("Image"),
-                "metadata": self.store.load(container),
+                "metadata": metadata,
             }
+
+            # Include compose service status if applicable
+            compose_project = (metadata or {}).get("compose_project")
+            if compose_project:
+                from .compose import ComposeManager
+
+                compose_mgr = ComposeManager(self.runtime)
+                status_result["compose_services"] = await compose_mgr.ps(compose_project)
+
+            return status_result
         except (json.JSONDecodeError, IndexError, KeyError) as exc:
             return {"error": f"Failed to parse status: {exc}"}
 
@@ -1018,6 +1120,23 @@ class ContainersTool:
         if not container:
             return {"error": "'container' is required"}
         force = inp.get("force", False)
+
+        # Tear down compose services if this container has them
+        metadata = self.store.load(container)
+        compose_project = (metadata or {}).get("compose_project")
+        if compose_project:
+            from .compose import ComposeManager
+
+            compose_mgr = ComposeManager(self.runtime)
+            await compose_mgr.down(compose_project)
+            # Clean up temp compose file if it exists
+            compose_file = (metadata or {}).get("compose_file")
+            if compose_file and "/tmp/" in compose_file and "amp-compose-" in compose_file:
+                try:
+                    os.unlink(compose_file)
+                except OSError:
+                    pass
+
         # Stop
         stop_cmd = "kill" if force else "stop"
         await self.runtime.run(stop_cmd, container, timeout=30)
