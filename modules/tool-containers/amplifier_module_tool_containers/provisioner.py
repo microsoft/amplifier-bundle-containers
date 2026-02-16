@@ -157,36 +157,49 @@ class ContainerProvisioner:
             return ProvisioningStep("forward_git", "skipped", "No git config found on host")
 
         # Parse output and filter blocked sections.
-        # Each line is section.key=value (values may contain '=').
-        filtered: list[tuple[str, str, str]] = []  # (section, subkey, value)
+        # Each line is section[.subsection].key=value (values may contain '=').
+        # 2-part: section.key  →  [section] + key
+        # 3+-part: section.middle.key  →  [section "middle"] + key
+        filtered: list[tuple[str, str | None, str, str]] = []  # (section, subsection, key, value)
         blocked_found: set[str] = set()
         for line in stdout.decode().strip().splitlines():
             if "=" not in line:
                 continue
-            key, _, value = line.partition("=")
-            if "." not in key:
+            raw_key, _, value = line.partition("=")
+            if "." not in raw_key:
                 continue
-            section, subkey = key.split(".", 1)
+            parts = raw_key.split(".")
+            section = parts[0]
             if section.lower() in blocked_sections:
                 blocked_found.add(section.lower())
                 continue
-            filtered.append((section, subkey, value))
+            if len(parts) == 2:
+                # section.key
+                filtered.append((section, None, parts[1], value))
+            else:
+                # section.subsection[.more].key — last part is the key,
+                # everything between first and last is the subsection
+                subsection = ".".join(parts[1:-1])
+                filtered.append((section, subsection, parts[-1], value))
 
-        # Build a proper .gitconfig file grouped by section.
-        sections: dict[str, list[tuple[str, str]]] = {}
-        for section, subkey, value in filtered:
-            sections.setdefault(section, []).append((subkey, value))
+        # Build a proper .gitconfig file grouped by section + subsection.
+        sections: dict[tuple[str, str | None], list[tuple[str, str]]] = {}
+        for section, subsection, key, value in filtered:
+            sections.setdefault((section, subsection), []).append((key, value))
 
         config_lines: list[str] = []
-        for section, entries in sections.items():
-            config_lines.append(f"[{section}]")
-            for subkey, value in entries:
+        for (section, subsection), entries in sections.items():
+            if subsection is not None:
+                config_lines.append(f'[{section} "{subsection}"]')
+            else:
+                config_lines.append(f"[{section}]")
+            for key, value in entries:
                 # Gitconfig quoting: values with \ or " must be double-quoted with escaping.
                 if "\\" in value or '"' in value:
                     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-                    config_lines.append(f'\t{subkey} = "{escaped}"')
+                    config_lines.append(f'\t{key} = "{escaped}"')
                 else:
-                    config_lines.append(f"\t{subkey} = {value}")
+                    config_lines.append(f"\t{key} = {value}")
 
         config_content = "\n".join(config_lines)
 

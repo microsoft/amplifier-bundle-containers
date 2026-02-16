@@ -611,8 +611,9 @@ async def test_provision_git_special_characters_in_values():
 
     heredoc_calls = [c for c in calls if len(c) > 4 and "cat >" in str(c[4])]
     written = heredoc_calls[0][4]
-    # Value with = in URL preserved correctly (partition splits on first = only)
-    assert "https://github.com/.insteadof = gh:" in written
+    # Value with = in URL preserved correctly (multi-segment key → subsection format)
+    assert '[url "https://github.com/"]' in written
+    assert "insteadof = gh:" in written
     # Single quotes don't need escaping in gitconfig
     assert "name = O'Brien" in written
     # Value with double quotes gets escaped and wrapped
