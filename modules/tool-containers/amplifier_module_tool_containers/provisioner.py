@@ -161,7 +161,12 @@ class ContainerProvisioner:
         # Inject git identity directly to handle include-based configs.
         # Host gitconfig may use [include] paths that don't exist in the container,
         # so we resolve user.name/user.email on the host and set them explicitly.
+        #
+        # IMPORTANT: We use pure shell (printf >> file) instead of `git config --file`
+        # because git may not be installed in the container yet — setup_commands
+        # (which install packages like git) run AFTER provisioning.
         identity_injected: list[str] = []
+        resolved: dict[str, str] = {}
         for git_key in ["user.name", "user.email"]:
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -175,19 +180,33 @@ class ContainerProvisioner:
                 git_stdout, _ = await proc.communicate()
                 value = git_stdout.decode().strip()
                 if value and proc.returncode == 0:
-                    escaped_value = value.replace("'", "'\\''")
-                    inject_result = await self.runtime.run(
-                        "exec",
-                        container,
-                        "/bin/sh",
-                        "-c",
-                        f"git config --file {home}/.gitconfig {git_key} '{escaped_value}'",
-                        timeout=5,
-                    )
-                    if inject_result.returncode == 0:
-                        identity_injected.append(git_key)
+                    resolved[git_key] = value
             except OSError:
-                pass  # Skip gracefully if host git config fails
+                pass  # Skip gracefully if host git config unavailable
+
+        if resolved:
+            # Build a [user] block and append via heredoc — no git needed in container.
+            # Gitconfig quoting: values with \ or " must be in double-quotes with escaping.
+            config_lines = ["[user]"]
+            for git_key, value in resolved.items():
+                subkey = git_key.split(".", 1)[1]
+                if "\\" in value or '"' in value:
+                    quoted = value.replace("\\", "\\\\").replace('"', '\\"')
+                    config_lines.append(f'\t{subkey} = "{quoted}"')
+                else:
+                    config_lines.append(f"\t{subkey} = {value}")
+            user_block = "\n".join(config_lines)
+            gitconfig_path = f"{home}/.gitconfig"
+            inject_result = await self.runtime.run(
+                "exec",
+                container,
+                "/bin/sh",
+                "-c",
+                f"cat >> {gitconfig_path} << 'AMPLIFIER_GIT_IDENTITY_EOF'\n\n{user_block}\nAMPLIFIER_GIT_IDENTITY_EOF",
+                timeout=5,
+            )
+            if inject_result.returncode == 0:
+                identity_injected = list(resolved.keys())
 
         detail = f"Copied {' + '.join(copied)}"
         if identity_injected:
