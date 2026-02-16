@@ -725,6 +725,70 @@ async def test_provision_gh_verified_in_container():
 
 
 @pytest.mark.asyncio
+async def test_provision_gh_auth_login_success_with_gh_cli():
+    """When gh CLI is in the container and login succeeds, detail includes 'gh auth login completed'."""
+    token = "ghp_test123"
+    commands_run: list[tuple[object, ...]] = []
+
+    async def _mock_run(*args, **kwargs):
+        commands_run.append(args)
+        cmd_str = " ".join(str(a) for a in args)
+        if "gh auth login" in cmd_str:
+            return CommandResult(0, "", "")  # login succeeds
+        if "printenv GH_TOKEN" in cmd_str:
+            return CommandResult(0, token + "\n", "")  # verify succeeds
+        if "which" in cmd_str:
+            return CommandResult(0, "/usr/bin/gh\n", "")  # gh CLI IS present
+        return CommandResult(0, "", "")
+
+    prov = _make_provisioner()
+    prov.runtime.run = _mock_run  # type: ignore[assignment]
+
+    step = await prov.provision_gh_auth(
+        "c1", gh_env_vars={"GH_TOKEN": token, "GITHUB_TOKEN": token}
+    )
+
+    assert step.status == "success"
+    assert "gh auth login completed" in step.detail
+
+    # Security: the login command must NOT interpolate the raw token
+    login_cmds = [
+        " ".join(str(a) for a in c)
+        for c in commands_run
+        if any("gh auth login" in str(a) for a in c)
+    ]
+    assert len(login_cmds) == 1
+    assert token not in login_cmds[0]  # should use printenv, not echo with token
+
+
+@pytest.mark.asyncio
+async def test_provision_gh_auth_login_failure_with_gh_cli():
+    """When gh CLI is in the container but login fails, detail includes 'gh auth login failed'."""
+    token = "ghp_test123"
+
+    async def _mock_run(*args, **kwargs):
+        cmd_str = " ".join(str(a) for a in args)
+        if "gh auth login" in cmd_str:
+            return CommandResult(1, "", "auth error")  # login FAILS
+        if "printenv GH_TOKEN" in cmd_str:
+            return CommandResult(0, token + "\n", "")
+        if "which" in cmd_str:
+            return CommandResult(0, "/usr/bin/gh\n", "")
+        return CommandResult(0, "", "")
+
+    prov = _make_provisioner()
+    prov.runtime.run = _mock_run  # type: ignore[assignment]
+
+    step = await prov.provision_gh_auth(
+        "c1", gh_env_vars={"GH_TOKEN": token, "GITHUB_TOKEN": token}
+    )
+
+    # Overall still success (token was verified), but login failed
+    assert step.status == "success"
+    assert "gh auth login failed" in step.detail
+
+
+@pytest.mark.asyncio
 async def test_provision_gh_failed_verification():
     """provision_gh_auth returns failed when token not visible in container."""
     prov = _make_provisioner()

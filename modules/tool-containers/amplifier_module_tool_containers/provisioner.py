@@ -313,18 +313,22 @@ class ContainerProvisioner:
                 error="Token was passed via -e flag but printenv GH_TOKEN returned empty",
             )
 
-        # If gh CLI is in the container, do full auth login
+        # If gh CLI is in the container, do full auth login using the env var
+        # (avoids interpolating the raw token into a shell string)
         gh_check = await self.runtime.run("exec", container, "which", "gh", timeout=5)
         if gh_check.returncode == 0:
-            await self.runtime.run(
+            login_result = await self.runtime.run(
                 "exec",
                 container,
                 "/bin/sh",
                 "-c",
-                f'echo "{token}" | gh auth login --with-token',
+                "printenv GH_TOKEN | gh auth login --with-token",
                 timeout=15,
             )
-            detail_parts.append("gh auth login completed")
+            if login_result.returncode == 0:
+                detail_parts.append("gh auth login completed")
+            else:
+                detail_parts.append("gh auth login failed")
 
         return ProvisioningStep("forward_gh", "success", " + ".join(detail_parts))
 
