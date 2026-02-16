@@ -212,20 +212,31 @@ async def test_provision_git_uses_dynamic_home():
     prov = _make_provisioner()
     prov.runtime.run = _track  # type: ignore[assignment]
 
-    # Create fake gitconfig so the copy logic triggers
-    with patch("amplifier_module_tool_containers.provisioner.Path") as mock_path:
+    with (
+        patch(
+            "amplifier_module_tool_containers.provisioner.asyncio.create_subprocess_exec"
+        ) as mock_exec,
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        proc = AsyncMock()
+        proc.communicate.return_value = (b"user.name=Test\n", b"")
+        proc.returncode = 0
+        mock_exec.return_value = proc
         mock_home = mock_path.home.return_value
-        mock_gitconfig = mock_home.__truediv__.return_value
-        mock_gitconfig.exists.return_value = True
-        mock_gitconfig.__str__ = lambda self: "/fakehome/.gitconfig"
+        mock_home.__truediv__ = lambda self, key: type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: f"/fakehome/{key}"}
+        )()
 
         await prov.provision_git("c1")
 
     # First call is get_container_home
     assert calls[0] == ("exec", "c1", "/bin/sh", "-c", "echo $HOME")
+    # Heredoc write targets /home/builder/.gitconfig
+    heredoc_calls = [c for c in calls if len(c) > 4 and "cat >" in str(c[4])]
+    assert any("/home/builder/.gitconfig" in str(c[4]) for c in heredoc_calls)
     # Verify no /root/ in any call
     for call in calls:
-        assert all("/root/" not in arg for arg in call)
+        assert all("/root/" not in str(arg) for arg in call)
 
 
 # ---------------------------------------------------------------------------
@@ -384,64 +395,281 @@ async def test_provision_git_success_returns_step():
     prov = _make_provisioner()
     prov.runtime.run = _track  # type: ignore[assignment]
 
-    with patch("amplifier_module_tool_containers.provisioner.Path") as mock_path:
+    git_output = b"user.name=Ben Krabach\nuser.email=ben@example.com\nalias.co=checkout\n"
+
+    with (
+        patch(
+            "amplifier_module_tool_containers.provisioner.asyncio.create_subprocess_exec"
+        ) as mock_exec,
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        proc = AsyncMock()
+        proc.communicate.return_value = (git_output, b"")
+        proc.returncode = 0
+        mock_exec.return_value = proc
         mock_home = mock_path.home.return_value
-        # Make .gitconfig exist
-        gitconfig_mock = type(
-            "FP", (), {"exists": lambda self: True, "__str__": lambda self: "/fakehome/.gitconfig"}
+        mock_home.__truediv__ = lambda self, key: type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: f"/fakehome/{key}"}
         )()
-        gitconfig_local_mock = type(
-            "FP",
-            (),
-            {"exists": lambda self: False, "__str__": lambda self: "/fakehome/.gitconfig.local"},
-        )()
-        known_hosts_mock = type(
-            "FP",
-            (),
-            {"exists": lambda self: False, "__str__": lambda self: "/fakehome/.ssh/known_hosts"},
-        )()
-
-        def _truediv(self, key):
-            if key == ".gitconfig":
-                return gitconfig_mock
-            if key == ".gitconfig.local":
-                return gitconfig_local_mock
-            if key == ".ssh/known_hosts":
-                return known_hosts_mock
-            return type(
-                "FP", (), {"exists": lambda s: False, "__str__": lambda s: f"/fakehome/{key}"}
-            )()
-
-        mock_home.__truediv__ = _truediv
 
         step = await prov.provision_git("c1")
 
     assert isinstance(step, ProvisioningStep)
     assert step.name == "forward_git"
     assert step.status == "success"
-    assert ".gitconfig" in step.detail
+    assert "3 settings" in step.detail
     assert step.error is None
 
 
 @pytest.mark.asyncio
 async def test_provision_git_skipped_no_config():
-    """provision_git returns skipped when no .gitconfig exists."""
+    """provision_git returns skipped when host has no git config."""
     prov = _make_provisioner()
 
-    with patch("amplifier_module_tool_containers.provisioner.Path") as mock_path:
-        mock_home = mock_path.home.return_value
-        # .gitconfig does not exist
-        no_file = type(
-            "FP", (), {"exists": lambda self: False, "__str__": lambda self: "/fakehome/.gitconfig"}
-        )()
-        mock_home.__truediv__ = lambda self, key: no_file
+    with patch(
+        "amplifier_module_tool_containers.provisioner.asyncio.create_subprocess_exec"
+    ) as mock_exec:
+        proc = AsyncMock()
+        proc.communicate.return_value = (b"", b"")
+        proc.returncode = 1
+        mock_exec.return_value = proc
 
         step = await prov.provision_git("c1")
 
     assert isinstance(step, ProvisioningStep)
     assert step.name == "forward_git"
     assert step.status == "skipped"
-    assert "No .gitconfig" in step.detail
+    assert "No git config" in step.detail
+
+
+@pytest.mark.asyncio
+async def test_provision_git_skipped_empty_output():
+    """provision_git returns skipped when git config returns empty output."""
+    prov = _make_provisioner()
+
+    with patch(
+        "amplifier_module_tool_containers.provisioner.asyncio.create_subprocess_exec"
+    ) as mock_exec:
+        proc = AsyncMock()
+        proc.communicate.return_value = (b"\n", b"")
+        proc.returncode = 0
+        mock_exec.return_value = proc
+
+        step = await prov.provision_git("c1")
+
+    assert step.status == "skipped"
+    assert "No git config" in step.detail
+
+
+@pytest.mark.asyncio
+async def test_provision_git_skipped_oserror():
+    """provision_git returns skipped when git is not installed on host."""
+    prov = _make_provisioner()
+
+    with patch(
+        "amplifier_module_tool_containers.provisioner.asyncio.create_subprocess_exec",
+        side_effect=OSError("No such file or directory"),
+    ):
+        step = await prov.provision_git("c1")
+
+    assert step.name == "forward_git"
+    assert step.status == "skipped"
+    assert "No git config" in step.detail
+
+
+@pytest.mark.asyncio
+async def test_provision_git_filters_blocked_sections():
+    """provision_git excludes credential, include, includeIf, http, safe sections."""
+    calls: list[tuple[str, ...]] = []
+
+    async def _track(*args: str, **kwargs: object) -> CommandResult:
+        calls.append(args)
+        return CommandResult(0, "/home/user\n", "")
+
+    prov = _make_provisioner()
+    prov.runtime.run = _track  # type: ignore[assignment]
+
+    git_output = (
+        b"user.name=Test User\n"
+        b"user.email=test@example.com\n"
+        b"credential.helper=!/usr/bin/gh auth git-credential\n"
+        b"include.path=~/.gitconfig.local\n"
+        b"includeif.gitdir:~/work/.path=~/.gitconfig-work\n"
+        b"http.proxy=http://proxy:8080\n"
+        b"safe.directory=/some/path\n"
+        b"alias.co=checkout\n"
+    )
+
+    with (
+        patch(
+            "amplifier_module_tool_containers.provisioner.asyncio.create_subprocess_exec"
+        ) as mock_exec,
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        proc = AsyncMock()
+        proc.communicate.return_value = (git_output, b"")
+        proc.returncode = 0
+        mock_exec.return_value = proc
+        mock_home = mock_path.home.return_value
+        mock_home.__truediv__ = lambda self, key: type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: f"/fakehome/{key}"}
+        )()
+
+        step = await prov.provision_git("c1")
+
+    assert step.status == "success"
+    assert "3 settings" in step.detail
+    assert "filtered" in step.detail
+
+    # Verify blocked content NOT in the heredoc
+    heredoc_calls = [c for c in calls if len(c) > 4 and "cat >" in str(c[4])]
+    assert len(heredoc_calls) == 1
+    written = heredoc_calls[0][4]
+    assert "[credential]" not in written
+    assert "[include]" not in written
+    assert "[includeif]" not in written
+    assert "[http]" not in written
+    assert "[safe]" not in written
+    # Allowed content IS present
+    assert "[user]" in written
+    assert "name = Test User" in written
+    assert "[alias]" in written
+    assert "co = checkout" in written
+
+
+@pytest.mark.asyncio
+async def test_provision_git_special_characters_in_values():
+    """provision_git handles values with =, quotes, and multi-dot keys."""
+    calls: list[tuple[str, ...]] = []
+
+    async def _track(*args: str, **kwargs: object) -> CommandResult:
+        calls.append(args)
+        return CommandResult(0, "/home/user\n", "")
+
+    prov = _make_provisioner()
+    prov.runtime.run = _track  # type: ignore[assignment]
+
+    git_output = (
+        b"user.name=O'Brien\n"
+        b"url.https://github.com/.insteadof=gh:\n"
+        b'user.signingkey=A "Special" Key\n'
+        b"core.pager=less -R\n"
+    )
+
+    with (
+        patch(
+            "amplifier_module_tool_containers.provisioner.asyncio.create_subprocess_exec"
+        ) as mock_exec,
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        proc = AsyncMock()
+        proc.communicate.return_value = (git_output, b"")
+        proc.returncode = 0
+        mock_exec.return_value = proc
+        mock_home = mock_path.home.return_value
+        mock_home.__truediv__ = lambda self, key: type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: f"/fakehome/{key}"}
+        )()
+
+        step = await prov.provision_git("c1")
+
+    assert step.status == "success"
+    assert "4 settings" in step.detail
+
+    heredoc_calls = [c for c in calls if len(c) > 4 and "cat >" in str(c[4])]
+    written = heredoc_calls[0][4]
+    # Value with = in URL preserved correctly (partition splits on first = only)
+    assert "https://github.com/.insteadof = gh:" in written
+    # Single quotes don't need escaping in gitconfig
+    assert "name = O'Brien" in written
+    # Value with double quotes gets escaped and wrapped
+    assert 'signingkey = "A \\"Special\\" Key"' in written
+    # Normal value stays plain
+    assert "pager = less -R" in written
+
+
+@pytest.mark.asyncio
+async def test_provision_git_copies_supplementary_files():
+    """provision_git still copies .gitconfig.local and .ssh/known_hosts."""
+    calls: list[tuple[str, ...]] = []
+
+    async def _track(*args: str, **kwargs: object) -> CommandResult:
+        calls.append(args)
+        return CommandResult(0, "/home/user\n", "")
+
+    prov = _make_provisioner()
+    prov.runtime.run = _track  # type: ignore[assignment]
+
+    with (
+        patch(
+            "amplifier_module_tool_containers.provisioner.asyncio.create_subprocess_exec"
+        ) as mock_exec,
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        proc = AsyncMock()
+        proc.communicate.return_value = (b"user.name=Test\n", b"")
+        proc.returncode = 0
+        mock_exec.return_value = proc
+        mock_home = mock_path.home.return_value
+
+        def _truediv(self, key):
+            exists = key in (".gitconfig.local", ".ssh/known_hosts")
+            return type(
+                "FP",
+                (),
+                {"exists": lambda self: exists, "__str__": lambda self: f"/fakehome/{key}"},
+            )()
+
+        mock_home.__truediv__ = _truediv
+
+        step = await prov.provision_git("c1")
+
+    assert step.status == "success"
+    assert ".gitconfig.local" in step.detail
+    assert ".ssh/known_hosts" in step.detail
+    # Verify docker cp was called for both supplementary files
+    cp_calls = [c for c in calls if c[0] == "cp"]
+    assert len(cp_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_provision_git_all_entries_filtered():
+    """provision_git writes empty config when all entries are blocked."""
+    calls: list[tuple[str, ...]] = []
+
+    async def _track(*args: str, **kwargs: object) -> CommandResult:
+        calls.append(args)
+        return CommandResult(0, "/home/user\n", "")
+
+    prov = _make_provisioner()
+    prov.runtime.run = _track  # type: ignore[assignment]
+
+    git_output = (
+        b"credential.helper=osxkeychain\n"
+        b"http.proxy=http://proxy:8080\n"
+        b"safe.directory=/opt/project\n"
+    )
+
+    with (
+        patch(
+            "amplifier_module_tool_containers.provisioner.asyncio.create_subprocess_exec"
+        ) as mock_exec,
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        proc = AsyncMock()
+        proc.communicate.return_value = (git_output, b"")
+        proc.returncode = 0
+        mock_exec.return_value = proc
+        mock_home = mock_path.home.return_value
+        mock_home.__truediv__ = lambda self, key: type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: f"/fakehome/{key}"}
+        )()
+
+        step = await prov.provision_git("c1")
+
+    assert step.status == "success"
+    assert "0 settings" in step.detail
+    assert "filtered" in step.detail
 
 
 @pytest.mark.asyncio

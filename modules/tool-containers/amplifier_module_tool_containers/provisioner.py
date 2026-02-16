@@ -128,91 +128,119 @@ class ContainerProvisioner:
     async def provision_git(
         self, container: str, target_home: str | None = None
     ) -> ProvisioningStep:
-        """Copy git configuration into the container."""
-        host_home = Path.home()
-        if not (host_home / ".gitconfig").exists():
-            return ProvisioningStep("forward_git", "skipped", "No .gitconfig found on host")
+        """Flatten host git config and write a clean .gitconfig into the container.
 
+        Instead of copying ~/.gitconfig verbatim (which breaks includes, doesn't
+        work with XDG config, etc.), we resolve all settings on the host via
+        ``git config --list --global``, filter out host-specific sections, and
+        write a self-contained .gitconfig into the container.
+        """
+        blocked_sections = frozenset({"credential", "include", "includeif", "http", "safe"})
+
+        # Resolve all global git config on the host.
+        # This resolves includes, XDG paths, etc. into flat key=value pairs.
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                "config",
+                "--list",
+                "--global",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+        except OSError:
+            return ProvisioningStep("forward_git", "skipped", "No git config found on host")
+
+        if proc.returncode != 0 or not stdout.strip():
+            return ProvisioningStep("forward_git", "skipped", "No git config found on host")
+
+        # Parse output and filter blocked sections.
+        # Each line is section.key=value (values may contain '=').
+        filtered: list[tuple[str, str, str]] = []  # (section, subkey, value)
+        blocked_found: set[str] = set()
+        for line in stdout.decode().strip().splitlines():
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            if "." not in key:
+                continue
+            section, subkey = key.split(".", 1)
+            if section.lower() in blocked_sections:
+                blocked_found.add(section.lower())
+                continue
+            filtered.append((section, subkey, value))
+
+        # Build a proper .gitconfig file grouped by section.
+        sections: dict[str, list[tuple[str, str]]] = {}
+        for section, subkey, value in filtered:
+            sections.setdefault(section, []).append((subkey, value))
+
+        config_lines: list[str] = []
+        for section, entries in sections.items():
+            config_lines.append(f"[{section}]")
+            for subkey, value in entries:
+                # Gitconfig quoting: values with \ or " must be double-quoted with escaping.
+                if "\\" in value or '"' in value:
+                    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+                    config_lines.append(f'\t{subkey} = "{escaped}"')
+                else:
+                    config_lines.append(f"\t{subkey} = {value}")
+
+        config_content = "\n".join(config_lines)
+
+        # Write the constructed config into the container via heredoc.
+        # Uses single-quoted delimiter to prevent shell expansion.
+        # git is NOT installed in the container at this point — only shell builtins.
         home = await self.get_container_home(container, target_home=target_home)
+        gitconfig_path = f"{home}/.gitconfig"
+        write_result = await self.runtime.run(
+            "exec",
+            container,
+            "/bin/sh",
+            "-c",
+            f"cat > {gitconfig_path} << 'AMPLIFIER_GITCONFIG_EOF'\n{config_content}\nAMPLIFIER_GITCONFIG_EOF",
+            timeout=5,
+        )
+        if write_result.returncode != 0:
+            return ProvisioningStep(
+                "forward_git",
+                "failed",
+                "Failed to write git config",
+                error=write_result.stderr.strip(),
+            )
+
+        # Copy supplementary files (.gitconfig.local, .ssh/known_hosts).
+        host_home = Path.home()
         copied: list[str] = []
         for src_name, dst_name in [
-            (".gitconfig", ".gitconfig"),
             (".gitconfig.local", ".gitconfig.local"),
             (".ssh/known_hosts", ".ssh/known_hosts"),
         ]:
             src = host_home / src_name
             if src.exists():
                 dst_path = f"{home}/{dst_name}"
-                # Ensure target directory exists
                 dst_dir = str(Path(dst_path).parent)
                 await self.runtime.run("exec", container, "mkdir", "-p", dst_dir, timeout=5)
                 result = await self.runtime.run(
                     "cp", str(src), f"{container}:{dst_path}", timeout=10
                 )
-                if result.returncode != 0:
-                    return ProvisioningStep(
-                        "forward_git",
-                        "failed",
-                        "Failed to copy git config",
-                        error=result.stderr.strip(),
-                    )
-                copied.append(src_name)
+                if result.returncode == 0:
+                    copied.append(src_name)
 
-        # Inject git identity directly to handle include-based configs.
-        # Host gitconfig may use [include] paths that don't exist in the container,
-        # so we resolve user.name/user.email on the host and set them explicitly.
-        #
-        # IMPORTANT: We use pure shell (printf >> file) instead of `git config --file`
-        # because git may not be installed in the container yet — setup_commands
-        # (which install packages like git) run AFTER provisioning.
-        identity_injected: list[str] = []
-        resolved: dict[str, str] = {}
-        for git_key in ["user.name", "user.email"]:
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "git",
-                    "config",
-                    "--global",
-                    git_key,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                git_stdout, _ = await proc.communicate()
-                value = git_stdout.decode().strip()
-                if value and proc.returncode == 0:
-                    resolved[git_key] = value
-            except OSError:
-                pass  # Skip gracefully if host git config unavailable
-
-        if resolved:
-            # Build a [user] block and append via heredoc — no git needed in container.
-            # Gitconfig quoting: values with \ or " must be in double-quotes with escaping.
-            config_lines = ["[user]"]
-            for git_key, value in resolved.items():
-                subkey = git_key.split(".", 1)[1]
-                if "\\" in value or '"' in value:
-                    quoted = value.replace("\\", "\\\\").replace('"', '\\"')
-                    config_lines.append(f'\t{subkey} = "{quoted}"')
-                else:
-                    config_lines.append(f"\t{subkey} = {value}")
-            user_block = "\n".join(config_lines)
-            gitconfig_path = f"{home}/.gitconfig"
-            inject_result = await self.runtime.run(
-                "exec",
-                container,
-                "/bin/sh",
-                "-c",
-                f"cat >> {gitconfig_path} << 'AMPLIFIER_GIT_IDENTITY_EOF'\n\n{user_block}\nAMPLIFIER_GIT_IDENTITY_EOF",
-                timeout=5,
+        # Build accurate detail string.
+        total = len(filtered)
+        detail_parts: list[str] = []
+        if blocked_found:
+            detail_parts.append(
+                f"Flattened git config ({total} settings, filtered {'/'.join(sorted(blocked_found))})"
             )
-            if inject_result.returncode == 0:
-                identity_injected = list(resolved.keys())
+        else:
+            detail_parts.append(f"Flattened git config ({total} settings)")
+        if copied:
+            detail_parts.append(f"copied {' + '.join(copied)}")
 
-        detail = f"Copied {' + '.join(copied)}"
-        if identity_injected:
-            detail += f", identity set ({' + '.join(identity_injected)})"
-
-        return ProvisioningStep("forward_git", "success", detail)
+        return ProvisioningStep("forward_git", "success", ", ".join(detail_parts))
 
     async def extract_gh_token(self) -> dict[str, str]:
         """Extract GitHub token from host gh CLI for injection at container creation time.
