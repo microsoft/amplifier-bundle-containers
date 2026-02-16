@@ -74,6 +74,10 @@ These make the container feel like home with zero effort:
 | `cache_bust` | `false` | Force fresh build, ignoring cached purpose image |
 | `amplifier_version` | latest | Pin Amplifier version (`purpose="amplifier"` only) |
 | `amplifier_bundle` | none | Bundle URI to configure inside container (`purpose="amplifier"` only) |
+| `compose_content` | none | Docker Compose YAML for multi-service infrastructure |
+| `compose_file` | none | Path to existing docker-compose.yml on host |
+| `repos` | none | Git repos to clone: [{url, path, install}] |
+| `config_files` | none | Files to write: {"/path": "content"} |
 
 ## Patterns
 
@@ -106,11 +110,17 @@ exec_poll(container="agent-a", job_id="...")
 exec_poll(container="agent-b", job_id="...")
 ```
 
-### Compose File Interpretation
-When a user has a docker-compose.yml, read the YAML and translate services
-into create + create_network + wait_healthy calls rather than suggesting
-`docker compose up`. This preserves credential forwarding, user mapping,
-and container tracking. See the container-guide for the full translation pattern.
+### Compose + Provisioned Workspace
+Start infrastructure via compose, work in a fully provisioned primary container:
+```
+create(name="my-stack",
+    compose_content="services:\n  db:\n    image: postgres:16\n  ...",
+    purpose="python",
+    repos=[{"url": "https://github.com/user/app", "path": "/workspace/app", "install": "pip install -e ."}],
+    config_files={"/workspace/.env": "DATABASE_URL=postgresql://db:5432/app\n"},
+    forward_gh=True)
+```
+Compose manages infrastructure (Postgres, Redis). Our tool manages the workspace with full provisioning.
 
 ## Important
 
@@ -122,4 +132,8 @@ and container tracking. See the container-guide for the full translation pattern
 - Use `purpose` to let the tool choose smart defaults — don't over-specify
 - Containers are ephemeral by default — destroyed on session end
 - Set `persistent=true` if the container should survive session restarts
+- `compose_content` lets the LLM write docker-compose.yml naturally (it already knows how)
+- `repos` clones multiple git repos with optional install commands
+- `config_files` writes arbitrary files to any path in the container
+- `destroy` automatically tears down compose services alongside the primary container
 - For complex multi-container setups, delegate to the `container-operator` agent

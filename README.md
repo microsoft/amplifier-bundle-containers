@@ -128,6 +128,49 @@ containers(operation="exec_background", container="agent-a",
     command="amplifier run 'refactor the auth module'")
 ```
 
+### Native Docker Compose Support
+
+Pass compose YAML directly — the LLM already knows how to write it:
+
+```yaml
+containers(create, name="my-stack",
+    compose_content="""
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: dev
+""",
+    purpose="python",
+    repos=[{"url": "https://github.com/user/my-app", "install": "pip install -e ."}],
+    config_files={"/workspace/.env": "DATABASE_URL=postgresql://db:5432/app"},
+    forward_gh=True)
+```
+
+Compose manages infrastructure. Our tool manages the workspace with full provisioning.
+
+### Multi-Repo Cloning
+
+Clone multiple repos with optional install commands in one call:
+
+```
+repos=[
+    {"url": "https://github.com/user/service-a", "install": "pip install -e ."},
+    {"url": "https://github.com/user/shared-lib", "path": "/workspace/lib"},
+]
+```
+
+### Arbitrary Config Files
+
+Write config files to any path inside the container:
+
+```
+config_files={
+    "/workspace/.storage.yaml": "provider: git\n",
+    "/workspace/.env": "DATABASE_URL=...\n",
+}
+```
+
 ### Operations
 
 **Core Lifecycle**

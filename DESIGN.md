@@ -351,5 +351,5 @@ Two-phase user model (root setup, mapped user exec, as_root override), amplifier
 ### Phase 4: Extended Capabilities — COMPLETE
 GPU passthrough preflight detection. `wait_healthy` operation for startup ordering. Compose-file interpretation pattern (agent translates compose YAML to create calls). 133 tests (117 unit + 16 integration).
 
-### Phase 5: Compose Integration + Repos + Config Files
-Native Docker Compose support (LLM writes compose YAML, tool handles lifecycle). Multi-repo cloning (`repos` parameter). Arbitrary file placement (`config_files` parameter). Compose services auto-destroyed on container destroy.
+### Phase 5: Compose Integration + Repos + Config Files — COMPLETE
+Native Docker Compose support, multi-repo cloning, arbitrary file placement. 160 tests (144 unit + 16 integration).

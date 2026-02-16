@@ -492,9 +492,49 @@ Use `amplifier_version` to pin a specific Amplifier version and `amplifier_bundl
 
 ---
 
-## Interpreting docker-compose.yml Files
+## Using docker-compose.yml
 
-When a user has a docker-compose.yml and wants to use it, DON'T suggest `docker compose up`. Instead, read the file and translate it into container tool calls. This preserves our full provisioning pipeline (credentials, dotfiles, user mapping, tracking).
+### Native Compose Support (Preferred)
+
+Pass compose YAML directly — the tool handles the rest:
+
+```
+containers(create, name="my-stack",
+    compose_content="""
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: dev
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+  redis:
+    image: redis:7
+""",
+    purpose="python",
+    repos=[
+        {"url": "https://github.com/user/my-app", "path": "/workspace/app", "install": "pip install -e ."},
+    ],
+    config_files={
+        "/workspace/.storage.yaml": "provider: git\n",
+    },
+    forward_gh=True,
+)
+```
+
+The tool:
+1. Runs `docker compose up -d` for infrastructure services (db, redis)
+2. Creates a fully provisioned primary container on the same network
+3. Clones repos and writes config files into the primary container
+4. Forwards credentials, dotfiles, and applies UID mapping
+5. Returns a provisioning report covering everything (including compose services)
+
+`destroy` automatically runs `compose down` to tear down infrastructure services.
+`status` includes compose service status alongside primary container info.
+
+### Manual Translation (For Fine-Grained Control)
+
+For cases where you need our provisioning on multiple services or want individual control, you can still translate compose YAML into individual tool calls:
 
 ### Translation Pattern
 
@@ -565,6 +605,44 @@ containers(create, name="app", purpose="python",
 ### When NOT to Translate
 
 If the compose file is very complex (10+ services, custom build contexts, init containers, tmpfs mounts, custom network drivers), tell the user they should use `docker compose` directly via bash. Our tool is for provisioned, managed containers — not for running arbitrary compose stacks.
+
+---
+
+## Repos Parameter
+
+Clone multiple git repos into the container with optional install commands:
+
+```
+containers(create, name="my-env", purpose="python",
+    repos=[
+        {"url": "https://github.com/user/service-a", "path": "/workspace/service-a", "install": "pip install -e ."},
+        {"url": "https://github.com/user/service-b", "path": "/workspace/service-b"},
+        {"url": "https://github.com/user/shared-lib", "path": "/workspace/shared-lib", "install": "pip install -e ."},
+    ])
+```
+
+- `url` (required): Git URL to clone
+- `path` (optional): Clone destination. Defaults to `/workspace/{repo-name}`
+- `install` (optional): Command to run after cloning (e.g., `pip install -e .`)
+- Results appear in the provisioning report with success/partial/failed status
+- Repos are cloned as root (during setup phase), so `git clone` of private repos works when `forward_gh=True`
+
+## Config Files Parameter
+
+Write arbitrary files to any path inside the container:
+
+```
+containers(create, name="my-env",
+    config_files={
+        "/workspace/.storage.yaml": "provider: git\nauto_sync: true\n",
+        "/workspace/.env": "DATABASE_URL=postgresql://localhost:5432/app\n",
+        "/workspace/config/settings.json": '{"debug": true}\n',
+    })
+```
+
+- Keys are absolute paths inside the container
+- Parent directories are created automatically
+- Results appear in the provisioning report
 
 ---
 

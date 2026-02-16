@@ -106,12 +106,16 @@ After creating containers for the user, always run `exec_interactive_hint` and p
 ### Read the Provisioning Report
 The `create` response includes a `provisioning_report` with the status of each setup step. Use it to identify and report any partial failures — don't exec into the container to investigate what the report already tells you.
 
-### Compose File Interpretation
-When a user has a docker-compose.yml, read the file and translate it into
-tool calls rather than suggesting `docker compose up`. This preserves
-credential forwarding, user mapping, and container tracking. Use
-`wait_healthy` for health-check-based startup ordering. See the
-"Interpreting docker-compose.yml" section in the container guide.
+### Compose Integration
+For multi-service setups, use `compose_content` to pass docker-compose.yml directly:
+```
+containers(create, name="my-stack",
+    compose_content="services:\n  db:\n    image: postgres:16\n  ...",
+    purpose="python", forward_gh=True)
+```
+The tool runs compose up for infrastructure, creates a provisioned primary container on the same network. Use `repos` to clone source code and `config_files` to write configuration. Destroy auto-runs compose down.
+
+For very complex compose files (10+ services, custom builds), suggest the user run `docker compose` directly via bash.
 
 ### Clean Up
 When done with containers the user no longer needs, destroy them. Track what you've created and offer cleanup.
