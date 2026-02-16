@@ -959,8 +959,10 @@ class ContainersTool:
                 },
             )
 
-            # Cache the image for next time (only for purpose-based creates without cache)
-            if purpose and not cache_used and not inp.get("cache_bust", False):
+            # Cache the image for next time (only when setup fully succeeded)
+            setup_step = next((s for s in report if s.name == "setup_commands"), None)
+            setup_ok = setup_step is None or setup_step.status == "success"
+            if purpose and not cache_used and not inp.get("cache_bust", False) and setup_ok:
                 await self._cache_image(name, purpose)
 
             # Get interactive hint
@@ -1165,6 +1167,8 @@ class ContainersTool:
         container_path = inp.get("container_path", "")
         if not all([container, host_path, container_path]):
             return {"error": "container, host_path, and container_path are required"}
+        # Resolve symlinks on the host path (fixes macOS /tmp -> /private/tmp)
+        host_path = os.path.realpath(host_path)
         result = await self.runtime.run(
             "cp", host_path, f"{container}:{container_path}", timeout=60
         )
@@ -1179,6 +1183,8 @@ class ContainersTool:
         host_path = inp.get("host_path", "")
         if not all([container, container_path, host_path]):
             return {"error": "container, container_path, and host_path are required"}
+        # Resolve symlinks on the host path (fixes macOS /tmp -> /private/tmp)
+        host_path = os.path.realpath(host_path)
         result = await self.runtime.run(
             "cp", f"{container}:{container_path}", host_path, timeout=60
         )

@@ -30,12 +30,7 @@ PURPOSE_PROFILES: dict[str, PurposeProfile] = {
         packages=["git", "curl", "build-essential"],
         setup_commands=[
             "pip install --quiet uv",
-            "uv venv /workspace/.venv",
         ],
-        env={
-            "VIRTUAL_ENV": "/workspace/.venv",
-            "PATH": "/workspace/.venv/bin:$PATH",
-        },
     ),
     "node": PurposeProfile(
         image="node:20-slim",

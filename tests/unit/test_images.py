@@ -75,15 +75,12 @@ def test_setup_commands_prepended():
 
 
 def test_purpose_env_merged():
-    """Purpose env merged with explicit env (explicit wins)."""
+    """Explicit env passed through when purpose has no env defaults."""
     result = resolve_purpose("python", {"env": {"VIRTUAL_ENV": "/custom", "MY_VAR": "1"}})
     env = result["env"]
-    # Explicit wins for VIRTUAL_ENV
+    # Explicit vars are kept as-is
     assert env["VIRTUAL_ENV"] == "/custom"
-    # User's extra var is kept
     assert env["MY_VAR"] == "1"
-    # Purpose's PATH env is still present
-    assert "PATH" in env
 
 
 # ---------------------------------------------------------------------------
