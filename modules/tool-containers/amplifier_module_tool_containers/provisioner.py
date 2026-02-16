@@ -145,6 +145,7 @@ class ContainerProvisioner:
                 "config",
                 "--list",
                 "--global",
+                "--includes",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

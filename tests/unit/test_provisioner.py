@@ -384,6 +384,35 @@ async def test_uid_gid_mapping_explicit_user(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_provision_git_uses_includes_flag():
+    """provision_git passes --includes so git resolves [include]/[includeIf] chains."""
+    prov = _make_provisioner()
+    prov.runtime.run = AsyncMock(return_value=CommandResult(0, "/home/user\n", ""))
+
+    with (
+        patch(
+            "amplifier_module_tool_containers.provisioner.asyncio.create_subprocess_exec"
+        ) as mock_exec,
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        proc = AsyncMock()
+        proc.communicate.return_value = (b"user.name=Test\n", b"")
+        proc.returncode = 0
+        mock_exec.return_value = proc
+        mock_home = mock_path.home.return_value
+        mock_home.__truediv__ = lambda self, key: type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: f"/fakehome/{key}"}
+        )()
+
+        await prov.provision_git("c1")
+
+    # Verify create_subprocess_exec was called with --includes
+    mock_exec.assert_called_once()
+    call_args = mock_exec.call_args[0]
+    assert "--includes" in call_args, f"Expected '--includes' in subprocess args, got: {call_args}"
+
+
+@pytest.mark.asyncio
 async def test_provision_git_success_returns_step():
     """provision_git returns ProvisioningStep with success status."""
     calls: list[tuple[str, ...]] = []
@@ -419,6 +448,10 @@ async def test_provision_git_success_returns_step():
     assert step.status == "success"
     assert "3 settings" in step.detail
     assert step.error is None
+
+    # Verify --includes flag is passed to resolve [include]/[includeIf] chains
+    mock_exec.assert_called_once()
+    assert "--includes" in mock_exec.call_args[0]
 
 
 @pytest.mark.asyncio
