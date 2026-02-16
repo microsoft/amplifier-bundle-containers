@@ -714,6 +714,13 @@ class ContainersTool:
             inp.get("env", {}),
             config_patterns,
         )
+
+        # Extract GH token for injection at container creation time (before docker run)
+        gh_env_vars: dict[str, str] = {}
+        if inp.get("forward_gh", True):
+            gh_env_vars = await self.provisioner.extract_gh_token()
+            env_vars.update(gh_env_vars)
+
         for key, value in env_vars.items():
             args.extend(["-e", f"{key}={value}"])
 
@@ -790,7 +797,9 @@ class ContainersTool:
             # GH auth
             if inp.get("forward_gh", True):
                 report.append(
-                    await self.provisioner.provision_gh_auth(name, target_home=target_home)
+                    await self.provisioner.provision_gh_auth(
+                        name, gh_env_vars=gh_env_vars, target_home=target_home
+                    )
                 )
             else:
                 report.append(ProvisioningStep("forward_gh", "skipped", "Not requested"))

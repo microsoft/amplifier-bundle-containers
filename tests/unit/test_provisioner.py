@@ -445,22 +445,92 @@ async def test_provision_git_skipped_no_config():
 
 
 @pytest.mark.asyncio
-async def test_provision_gh_skipped_no_cli():
-    """provision_gh_auth returns skipped when gh CLI not found."""
+async def test_provision_gh_skipped_no_token():
+    """provision_gh_auth returns skipped when no gh_env_vars provided."""
     prov = _make_provisioner()
 
-    with patch("amplifier_module_tool_containers.provisioner.shutil.which", return_value=None):
-        step = await prov.provision_gh_auth("c1")
+    step = await prov.provision_gh_auth("c1")
 
     assert isinstance(step, ProvisioningStep)
     assert step.name == "forward_gh"
     assert step.status == "skipped"
-    assert "not found" in step.detail
+    assert "No GH token" in step.detail
 
 
 @pytest.mark.asyncio
-async def test_provision_gh_skipped_not_authenticated():
-    """provision_gh_auth returns skipped when gh auth token fails."""
+async def test_provision_gh_skipped_empty_env_vars():
+    """provision_gh_auth returns skipped when gh_env_vars is empty dict."""
+    prov = _make_provisioner()
+
+    step = await prov.provision_gh_auth("c1", gh_env_vars={})
+
+    assert isinstance(step, ProvisioningStep)
+    assert step.name == "forward_gh"
+    assert step.status == "skipped"
+    assert "No GH token" in step.detail
+
+
+@pytest.mark.asyncio
+async def test_provision_gh_verified_in_container():
+    """provision_gh_auth verifies token is visible and reports success."""
+    token = "ghp_test123"
+
+    async def _mock_run(*args, **kwargs):
+        cmd_str = " ".join(str(a) for a in args)
+        if "printenv GH_TOKEN" in cmd_str:
+            return CommandResult(0, token + "\n", "")
+        if "which" in cmd_str and "gh" in cmd_str:
+            return CommandResult(1, "", "")  # No gh CLI in container
+        return CommandResult(0, "", "")
+
+    prov = _make_provisioner()
+    prov.runtime.run = _mock_run  # type: ignore[assignment]
+
+    step = await prov.provision_gh_auth(
+        "c1", gh_env_vars={"GH_TOKEN": token, "GITHUB_TOKEN": token}
+    )
+
+    assert isinstance(step, ProvisioningStep)
+    assert step.name == "forward_gh"
+    assert step.status == "success"
+    assert "verified" in step.detail
+
+
+@pytest.mark.asyncio
+async def test_provision_gh_failed_verification():
+    """provision_gh_auth returns failed when token not visible in container."""
+    prov = _make_provisioner()
+    prov.runtime.run = AsyncMock(return_value=CommandResult(0, "\n", ""))
+
+    step = await prov.provision_gh_auth(
+        "c1", gh_env_vars={"GH_TOKEN": "ghp_test", "GITHUB_TOKEN": "ghp_test"}
+    )
+
+    assert isinstance(step, ProvisioningStep)
+    assert step.name == "forward_gh"
+    assert step.status == "failed"
+    assert "not visible" in step.detail
+
+
+# ---------------------------------------------------------------------------
+# extract_gh_token
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_extract_gh_token_no_cli():
+    """extract_gh_token returns empty dict when gh CLI not found."""
+    prov = _make_provisioner()
+
+    with patch("amplifier_module_tool_containers.provisioner.shutil.which", return_value=None):
+        result = await prov.extract_gh_token()
+
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_extract_gh_token_not_authenticated():
+    """extract_gh_token returns empty dict when gh auth token fails."""
     prov = _make_provisioner()
 
     with (
@@ -476,12 +546,32 @@ async def test_provision_gh_skipped_not_authenticated():
         proc.returncode = 1
         mock_proc.return_value = proc
 
-        step = await prov.provision_gh_auth("c1")
+        result = await prov.extract_gh_token()
 
-    assert isinstance(step, ProvisioningStep)
-    assert step.name == "forward_gh"
-    assert step.status == "skipped"
-    assert "not authenticated" in step.detail
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_extract_gh_token_success():
+    """extract_gh_token returns GH_TOKEN and GITHUB_TOKEN when authenticated."""
+    prov = _make_provisioner()
+
+    with (
+        patch(
+            "amplifier_module_tool_containers.provisioner.shutil.which", return_value="/usr/bin/gh"
+        ),
+        patch(
+            "amplifier_module_tool_containers.provisioner.asyncio.create_subprocess_exec"
+        ) as mock_proc,
+    ):
+        proc = AsyncMock()
+        proc.communicate.return_value = (b"ghp_abc123\n", b"")
+        proc.returncode = 0
+        mock_proc.return_value = proc
+
+        result = await prov.extract_gh_token()
+
+    assert result == {"GH_TOKEN": "ghp_abc123", "GITHUB_TOKEN": "ghp_abc123"}
 
 
 @pytest.mark.asyncio

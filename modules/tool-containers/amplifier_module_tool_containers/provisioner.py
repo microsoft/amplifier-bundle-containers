@@ -158,17 +158,53 @@ class ContainerProvisioner:
                     )
                 copied.append(src_name)
 
-        return ProvisioningStep("forward_git", "success", f"Copied {' + '.join(copied)}")
+        # Inject git identity directly to handle include-based configs.
+        # Host gitconfig may use [include] paths that don't exist in the container,
+        # so we resolve user.name/user.email on the host and set them explicitly.
+        identity_injected: list[str] = []
+        for git_key in ["user.name", "user.email"]:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "git",
+                    "config",
+                    "--global",
+                    git_key,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                git_stdout, _ = await proc.communicate()
+                value = git_stdout.decode().strip()
+                if value and proc.returncode == 0:
+                    escaped_value = value.replace("'", "'\\''")
+                    inject_result = await self.runtime.run(
+                        "exec",
+                        container,
+                        "/bin/sh",
+                        "-c",
+                        f"git config --file {home}/.gitconfig {git_key} '{escaped_value}'",
+                        timeout=5,
+                    )
+                    if inject_result.returncode == 0:
+                        identity_injected.append(git_key)
+            except OSError:
+                pass  # Skip gracefully if host git config fails
 
-    async def provision_gh_auth(
-        self, container: str, target_home: str | None = None
-    ) -> ProvisioningStep:
-        """Forward GitHub CLI authentication into the container."""
+        detail = f"Copied {' + '.join(copied)}"
+        if identity_injected:
+            detail += f", identity set ({' + '.join(identity_injected)})"
+
+        return ProvisioningStep("forward_git", "success", detail)
+
+    async def extract_gh_token(self) -> dict[str, str]:
+        """Extract GitHub token from host gh CLI for injection at container creation time.
+
+        Returns a dict of env vars (GH_TOKEN, GITHUB_TOKEN) to pass as -e flags
+        to docker run. Returns empty dict if gh is not installed or not authenticated.
+        """
         gh_path = shutil.which("gh")
         if not gh_path:
-            return ProvisioningStep("forward_gh", "skipped", "gh CLI not found on host")
+            return {}
 
-        # Extract token from host gh cli
         proc = await asyncio.create_subprocess_exec(
             "gh",
             "auth",
@@ -178,30 +214,59 @@ class ContainerProvisioner:
         )
         stdout, _ = await proc.communicate()
         if proc.returncode != 0:
-            return ProvisioningStep(
-                "forward_gh", "skipped", "gh CLI not authenticated — run 'gh auth login' on host"
-            )
+            return {}
         token = stdout.decode().strip()
         if not token:
+            return {}
+
+        return {"GH_TOKEN": token, "GITHUB_TOKEN": token}
+
+    async def provision_gh_auth(
+        self,
+        container: str,
+        gh_env_vars: dict[str, str] | None = None,
+        target_home: str | None = None,
+    ) -> ProvisioningStep:
+        """Verify GH token injection and optionally run gh auth login.
+
+        The GH_TOKEN/GITHUB_TOKEN env vars should already be injected at docker run
+        time via extract_gh_token(). This method:
+        1. Verifies the token is actually visible in the container environment
+        2. Runs ``gh auth login --with-token`` if gh CLI is installed in the container
+        """
+        if not gh_env_vars:
             return ProvisioningStep(
-                "forward_gh", "skipped", "gh CLI not authenticated — run 'gh auth login' on host"
+                "forward_gh",
+                "skipped",
+                "No GH token available (gh CLI missing or not authenticated on host)",
             )
 
-        home = await self.get_container_home(container, target_home=target_home)
-        # Inject as env vars
-        bashrc = f"{home}/.bashrc"
-        env_script = (
-            f'echo "export GH_TOKEN={token}" >> {bashrc} && '
-            f'echo "export GITHUB_TOKEN={token}" >> {bashrc}'
+        token = gh_env_vars.get("GH_TOKEN", "")
+        if not token:
+            return ProvisioningStep(
+                "forward_gh",
+                "skipped",
+                "No GH token available (gh CLI missing or not authenticated on host)",
+            )
+
+        detail_parts: list[str] = []
+
+        # Verify token is actually visible in the container environment
+        verify = await self.runtime.run(
+            "exec", container, "/bin/sh", "-c", "printenv GH_TOKEN", timeout=5
         )
-        result = await self.runtime.run("exec", container, "/bin/sh", "-c", env_script, timeout=5)
-        if result.returncode != 0:
+        verify_token = verify.stdout.strip()
+        if verify_token == token:
+            detail_parts.append("GH_TOKEN verified in container env")
+        else:
             return ProvisioningStep(
-                "forward_gh", "failed", "Failed to inject GH token", error=result.stderr.strip()
+                "forward_gh",
+                "failed",
+                "GH_TOKEN not visible in container environment",
+                error="Token was passed via -e flag but printenv GH_TOKEN returned empty",
             )
 
-        detail_parts = ["GH token injected"]
-        # If gh is in the container, do full auth login
+        # If gh CLI is in the container, do full auth login
         gh_check = await self.runtime.run("exec", container, "which", "gh", timeout=5)
         if gh_check.returncode == 0:
             await self.runtime.run(
