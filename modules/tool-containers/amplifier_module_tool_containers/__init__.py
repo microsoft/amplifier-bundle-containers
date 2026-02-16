@@ -645,7 +645,7 @@ class ContainersTool:
 
         # Image + command
         args.append(image)
-        args.extend(["tail", "-f", "/dev/null"])
+        args.extend(["/bin/sh", "-c", "while true; do sleep 1 2>/dev/null || true; done"])
 
         # Create the container
         result = await self.runtime.run(*args, timeout=120)
