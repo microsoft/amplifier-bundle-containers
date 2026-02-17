@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from amplifier_core.models import HookResult
+
 __amplifier_module_type__ = "hook"
 
 logger = logging.getLogger(__name__)
@@ -53,13 +55,13 @@ class ContainerSafetyHooks:
         self.auto_cleanup = self.config.get("auto_cleanup_on_session_end", True)
         self._session_containers: list[str] = []
 
-    async def handle_tool_pre(self, event: dict[str, Any]) -> dict[str, Any]:
+    async def handle_tool_pre(self, event: str, data: dict[str, Any]) -> HookResult:
         """Inspect container tool calls and enforce policies."""
-        tool_name = event.get("tool_name", "")
-        tool_input = event.get("tool_input", {})
+        tool_name = data.get("tool_name", "")
+        tool_input = data.get("tool_input", {})
 
         if tool_name != "containers":
-            return {"action": "continue"}
+            return HookResult(action="continue")
 
         operation = tool_input.get("operation", "")
         reasons: list[str] = []
@@ -109,34 +111,34 @@ class ContainerSafetyHooks:
 
         # Check: Container limit
         if operation == "create" and len(self._session_containers) >= self.max_containers:
-            return {
-                "action": "deny",
-                "reason": (
+            return HookResult(
+                action="deny",
+                reason=(
                     f"Container limit reached ({self.max_containers}). "
                     "Destroy existing containers before creating new ones."
                 ),
-            }
+            )
 
         if reasons:
-            return {
-                "action": "ask_user",
-                "message": (
+            return HookResult(
+                action="ask_user",
+                approval_prompt=(
                     "Container safety review required:\n"
                     + "\n".join(f"  - {r}" for r in reasons)
                     + "\n\nAllow this operation?"
                 ),
-            }
+            )
 
-        return {"action": "continue"}
+        return HookResult(action="continue")
 
-    async def handle_tool_post(self, event: dict[str, Any]) -> dict[str, Any]:
+    async def handle_tool_post(self, event: str, data: dict[str, Any]) -> HookResult:
         """Track containers created in this session."""
-        tool_name = event.get("tool_name", "")
-        tool_input = event.get("tool_input", {})
-        tool_output = event.get("tool_output", {})
+        tool_name = data.get("tool_name", "")
+        tool_input = data.get("tool_input", {})
+        tool_output = data.get("tool_output", {})
 
         if tool_name != "containers":
-            return {"action": "continue"}
+            return HookResult(action="continue")
 
         operation = tool_input.get("operation", "")
 
@@ -155,12 +157,12 @@ class ContainerSafetyHooks:
             elif operation == "destroy_all":
                 self._session_containers.clear()
 
-        return {"action": "continue"}
+        return HookResult(action="continue")
 
-    async def handle_session_end(self, event: dict[str, Any]) -> dict[str, Any]:
+    async def handle_session_end(self, event: str, data: dict[str, Any]) -> HookResult:
         """Clean up non-persistent containers when session ends."""
         if not self.auto_cleanup or not self._session_containers:
-            return {"action": "continue"}
+            return HookResult(action="continue")
 
         logger.info(
             "Session ending — cleaning up %d container(s): %s",
@@ -169,10 +171,10 @@ class ContainerSafetyHooks:
         )
         # The actual cleanup is best-effort — we emit the intent
         # and the orchestrator/tool handles execution
-        return {
-            "action": "continue",
-            "cleanup_containers": list(self._session_containers),
-        }
+        return HookResult(
+            action="continue",
+            data={"cleanup_containers": list(self._session_containers)},
+        )
 
     def _is_sensitive_path(self, path: str) -> bool:
         """Check if a host path is considered sensitive."""
