@@ -58,6 +58,7 @@ class CreateParams:
     persistent: bool = False
     labels: dict[str, str] = field(default_factory=dict)
     session_id: str | None = None
+    add_hosts: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +314,11 @@ class ContainersTool:
                             "type": "boolean",
                             "default": False,
                             "description": "Ignore cached image, build fresh",
+                        },
+                        "add_hosts": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of extra host entries to add to the container's /etc/hosts via --add-host. Format: 'hostname:ip' or 'hostname:host-gateway'. Example: ['host.docker.internal:host-gateway']",
                         },
                     },
                     "required": ["operation"],
@@ -745,6 +751,10 @@ class ContainersTool:
         labels.update(inp.get("labels", {}))
         for key, value in labels.items():
             args.extend(["-l", f"{key}={value}"])
+
+        # Extra host entries
+        for host_entry in inp.get("add_hosts", []):
+            args += ["--add-host", host_entry]
 
         # Image + command
         args.append(image)
