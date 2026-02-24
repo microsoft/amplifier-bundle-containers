@@ -197,7 +197,7 @@ class ContainerProvisioner:
                 # Gitconfig quoting: values with \ or " must be double-quoted with escaping.
                 if "\\" in value or '"' in value:
                     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-                    config_lines.append(f'\t{key} = "{escaped}"')
+                    config_lines.append(f'\t{key} = "{content}"')
                 else:
                     config_lines.append(f"\t{key} = {value}")
 
@@ -499,13 +499,12 @@ class ContainerProvisioner:
         written: list[str] = []
         failed: list[dict[str, str]] = []
         for path, content in config_files.items():
-            escaped = content.replace("'", "'\\''")
             result = await self.runtime.run(
                 "exec",
                 container,
                 "/bin/sh",
                 "-c",
-                f"mkdir -p $(dirname '{path}') && cat > '{path}' << 'AMPLIFIER_CONFIG_EOF'\n{escaped}\nAMPLIFIER_CONFIG_EOF",
+                f"mkdir -p $(dirname '{path}') && cat > '{path}' << 'AMPLIFIER_CONFIG_EOF'\n{content}\nAMPLIFIER_CONFIG_EOF",
                 timeout=10,
             )
             if result.returncode == 0:
@@ -628,13 +627,12 @@ class ContainerProvisioner:
     ) -> ProvisioningStep:
         """Write inline dotfiles content into the container."""
         for path, content in files.items():
-            escaped = content.replace("'", "'\\''")
             await self.runtime.run(
                 "exec",
                 container,
                 "/bin/sh",
                 "-c",
-                f"mkdir -p $(dirname ~/{path}) && cat > ~/{path} << 'AMPLIFIER_DOTFILES_EOF'\n{escaped}\nAMPLIFIER_DOTFILES_EOF",
+                f"mkdir -p $(dirname ~/{path}) && cat > ~/{path} << 'AMPLIFIER_DOTFILES_EOF'\n{content}\nAMPLIFIER_DOTFILES_EOF",
                 timeout=10,
             )
 
