@@ -571,6 +571,61 @@ async def test_provision_git_filters_blocked_sections():
 
 
 @pytest.mark.asyncio
+async def test_provision_git_quoting_branch_backslash_in_value():
+    """Regression: NameError when git config value contains a backslash.
+
+    Before the fix, provisioner.py:200 referenced `content` (undefined) instead
+    of `escaped`, crashing with NameError on any value containing \\ or ".
+    Backslash values are common in Windows paths and credential-helper settings.
+    """
+    calls: list[tuple[str, ...]] = []
+
+    async def _track(*args: str, **kwargs: object) -> CommandResult:
+        calls.append(args)
+        return CommandResult(0, "/home/user\n", "")
+
+    prov = _make_provisioner()
+    prov.runtime.run = _track  # type: ignore[assignment]
+
+    # core.autocrlf and gpg.program with Windows-style backslash path are
+    # common real-world configs that trigger the quoting branch.
+    git_output = (
+        b"user.name=Test User\n"
+        b"core.sshcommand=C:\\\\Windows\\\\System32\\\\OpenSSH\\\\ssh.exe\n"
+        b"user.email=test@example.com\n"
+    )
+
+    with (
+        patch(
+            "amplifier_module_tool_containers.provisioner.asyncio.create_subprocess_exec"
+        ) as mock_exec,
+        patch("amplifier_module_tool_containers.provisioner.Path") as mock_path,
+    ):
+        proc = AsyncMock()
+        proc.communicate.return_value = (git_output, b"")
+        proc.returncode = 0
+        mock_exec.return_value = proc
+        mock_home = mock_path.home.return_value
+        mock_home.__truediv__ = lambda self, key: type(
+            "FP", (), {"exists": lambda self: False, "__str__": lambda self: f"/fakehome/{key}"}
+        )()
+
+        step = await prov.provision_git("c1")
+
+    # Must succeed — not crash with NameError: name 'content' is not defined
+    assert step.status == "success"
+    assert "3 settings" in step.detail
+
+    heredoc_calls = [c for c in calls if len(c) > 4 and "cat >" in str(c[4])]
+    written = heredoc_calls[0][4]
+    # Backslash value must be quoted and escaped in the written config
+    assert "[core]" in written
+    assert "sshcommand" in written
+    # The value should be wrapped in double-quotes with escaped backslashes
+    assert 'sshcommand = "' in written
+
+
+@pytest.mark.asyncio
 async def test_provision_git_special_characters_in_values():
     """provision_git handles values with =, quotes, and multi-dot keys."""
     calls: list[tuple[str, ...]] = []

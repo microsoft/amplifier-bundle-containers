@@ -197,7 +197,7 @@ class ContainerProvisioner:
                 # Gitconfig quoting: values with \ or " must be double-quoted with escaping.
                 if "\\" in value or '"' in value:
                     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-                    config_lines.append(f'\t{key} = "{content}"')
+                    config_lines.append(f'\t{key} = "{escaped}"')
                 else:
                     config_lines.append(f"\t{key} = {value}")
 
