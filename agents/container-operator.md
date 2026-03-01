@@ -15,6 +15,7 @@ meta:
     Do NOT delegate for simple operations (create one container, run a command, destroy).
     The root assistant handles those directly via the containers tool.
 
+  model_role: [critical-ops, coding, general]
 tools:
   - module: tool-containers
     source: "git+https://github.com/microsoft/amplifier-bundle-containers@main#subdirectory=modules/tool-containers"
