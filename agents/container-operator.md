@@ -128,3 +128,7 @@ When done with containers the user no longer needs, destroy them. Track what you
 - **Network connectivity issues** — Verify network exists, verify containers are on it
 - **Self-delegation detected** — If you find yourself about to delegate to `container-operator`, STOP. You ARE container-operator. Use the `containers` tool directly.
 - Do NOT debug Docker internals. Report what's failing and let the user or a specialist handle it.
+
+---
+
+@foundation:context/LANGUAGE_PHILOSOPHY.md
