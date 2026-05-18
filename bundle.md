@@ -1,7 +1,7 @@
 ---
 bundle:
   name: containers
-  version: 0.1.0
+  version: 0.2.0
   description: General-purpose container management for Amplifier agents
 
 includes:
@@ -12,4 +12,10 @@ includes:
 
 # Container Management
 
-@containers:context/container-awareness.md
+For container orchestration patterns and Docker/Incus operations, delegate to
+`container-operator` — it carries the full container-awareness reference.
+
+<!-- container-awareness.md previously @-mentioned here AND in behaviors/containers.yaml
+     (double-load). Now loaded only via the container-operator agent body
+     (context-sink pattern). -->
+

@@ -132,3 +132,5 @@ When done with containers the user no longer needs, destroy them. Track what you
 ---
 
 @foundation:context/LANGUAGE_PHILOSOPHY.md
+
+@containers:context/container-awareness.md

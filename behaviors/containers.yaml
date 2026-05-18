@@ -1,6 +1,6 @@
 bundle:
   name: behavior-containers
-  version: 0.1.0
+  version: 0.2.0
   description: Container management for isolated environments
 
 tools:
@@ -41,6 +41,5 @@ agents:
   include:
     - containers:agents/container-operator
 
-context:
-  include:
-    - containers:context/container-awareness.md
+# The container-awareness.md reference is loaded via the container-operator agent body
+# (context-sink pattern). Always-on context.include is intentionally empty.
